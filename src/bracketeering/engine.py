@@ -32,7 +32,7 @@ from statistics import median
 from .bursts import BurstConfig, TimelapseConfig, form_bursts, form_timelapses
 from .cycles import CycleConfig, bracket_cycles
 from .model import Group, Shot, frame_step
-from .pixels import similarity
+from .pixels import registration, similarity
 
 NEG_INF = float("-inf")
 
@@ -655,7 +655,7 @@ def detect(shots: list[Shot], cfg: EngineConfig | None = None) -> list[Group]:
         cam_shots.sort(key=_order_key)
         ctx = _CameraContext(reports_aeb=any(s.meta.exposure_mode == 2 for s in cam_shots))
         cam_shots_all = cam_shots
-        maker_groups, cam_shots = bracket_cycles(cam_shots, cfg.cycles, similarity)
+        maker_groups, cam_shots = bracket_cycles(cam_shots, cfg.cycles, similarity, registration)
         runs = split_runs(cam_shots, cfg)
         cache: _Cache = {}  # group evaluations keyed by (first shot, size); shots outlive the call
         groups = [g for run in runs for g in _segment_run(run, ctx, cfg, None, cache)]

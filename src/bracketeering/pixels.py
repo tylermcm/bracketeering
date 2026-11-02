@@ -123,8 +123,13 @@ def _ncc(a: bytes, b: bytes, width: int, margin_x: int, margin_y: int, dx: int, 
 
 def thumb_similarity(a: bytes, b: bytes) -> float:
     """How well two band-passed thumbnails register (-1..1), allowing ~12 % drift."""
+    return thumb_registration(a, b)[0]
+
+
+def thumb_registration(a: bytes, b: bytes) -> tuple[float, float]:
+    """(how well two band-passed thumbnails register, at what shift as a fraction of the frame)."""
     if len(a) != len(b) or len(a) != THUMB_W * THUMB_H:
-        return -1.0
+        return -1.0, 1.0
     ca, cb = _coarse(a), _coarse(b)
     cw = THUMB_W // COARSE
     best, bx, by = -2.0, 0, 0
@@ -133,12 +138,14 @@ def thumb_similarity(a: bytes, b: bytes) -> float:
             v = _ncc(ca, cb, cw, SHIFT, SHIFT // 2, dx, dy)
             if v > best:
                 best, bx, by = v, dx, dy
-    fine = -2.0
+    fine, fx, fy = -2.0, 0, 0
     mx, my = SHIFT * COARSE + 1, (SHIFT // 2) * COARSE + 1
     for dy in range(by * COARSE - 1, by * COARSE + 2):
         for dx in range(bx * COARSE - 1, bx * COARSE + 2):
-            fine = max(fine, _ncc(a, b, THUMB_W, mx, my, dx, dy))
-    return fine
+            v = _ncc(a, b, THUMB_W, mx, my, dx, dy)
+            if v > fine:
+                fine, fx, fy = v, dx, dy
+    return fine, max(abs(fx) / THUMB_W, abs(fy) / THUMB_H)
 
 
 MIN_DETAIL = 4.0  # std of the band-passed thumbnail (0-255): below this a frame is featureless
@@ -162,6 +169,14 @@ def similarity(a, b) -> float | None:
     if ta is None or tb is None or detail(ta) < MIN_DETAIL or detail(tb) < MIN_DETAIL:
         return None
     return thumb_similarity(ta, tb)
+
+
+def registration(a, b) -> tuple[float, float] | None:
+    """(registration score, shift fraction) of two shots' previews, or None when unknown/featureless."""
+    ta, tb = getattr(a.pixels, "thumb", None), getattr(b.pixels, "thumb", None)
+    if ta is None or tb is None or detail(ta) < MIN_DETAIL or detail(tb) < MIN_DETAIL:
+        return None
+    return thumb_registration(ta, tb)
 
 
 LAYOUT_W, LAYOUT_H = 28, 20

@@ -210,15 +210,33 @@ def test_slow_irregular_presses_are_never_a_burst():
     assert kinds(detect(b.shots), "burst") == []
 
 
-def test_cycle_split_across_a_long_pause_needs_matching_previews():
-    """Japan DSC_6982/6983: 24 s pause, recomposed; similarity only middling (not a clear mismatch)."""
+@pytest.mark.parametrize("score_shift,joined", [
+    ((0.42, 0.10), False),  # Japan DSC_6982/6983: 24 s pause, recomposed
+    ((0.746, 0.09), False),  # China DSC_1300 -> 1301: 12 s pause, recomposed (0.3.3 joined it)
+    ((0.504, 0.06), False),  # China _DSC1627 -> 1628: 9 s pause, reframed, fog moved
+    ((0.70, 0.08), False),  # Alaska night sky DSC_1712 -> 1713: camera turned between frames
+    ((0.62, 0.01), True),  # Alaska aurora on a tripod: modest score, no shift
+    ((0.91, 0.06), True),  # Japan waterfall DSC_6991/6992: same composition, 11 s apart
+    (None, False),  # Alaska DSC_1758 -> 1759: black misfire, nothing to register
+])
+def test_cycle_across_a_long_pause_needs_positive_registration(score_shift, joined):
     from bracketeering.cycles import CycleConfig, bracket_cycles
     b = Body(model="NIKON D810")
     b.frame("DSC_6982.NEF", 0, slot=0, drive="single")
     b.frame("DSC_6983.NEF", 23.9, slot=-1, drive="single")
-    groups, _ = bracket_cycles(b.shots, CycleConfig(), lambda x, y: 0.42)
-    assert [g.kind for g in groups] == ["single", "single"]
-    groups, _ = bracket_cycles(b.shots, CycleConfig(), lambda x, y: 0.9)  # waterfall, same composition
+    for s in b.shots:
+        s.pixels = PixelStats(0, 0, 0, 0.4, "ok")
+    groups, _ = bracket_cycles(b.shots, CycleConfig(), None, lambda x, y: score_shift)
+    assert [g.kind for g in groups] == (["exposure"] if joined else ["single", "single"])
+
+
+def test_cycle_across_a_long_pause_without_previews_uses_rhythm():
+    """No --pixels: aurora cycles (presses every ~40 s) stay whole; a lone long pause splits."""
+    from bracketeering.cycles import CycleConfig, bracket_cycles
+    b = Body(model="NIKON D850")
+    for i, (v, after) in enumerate(zip((0, -2 / 3, -1 / 3, 1 / 3, 2 / 3), (0, 40, 45, 38, 42))):
+        b.frame(f"DSC_{1722 + i}.NEF", after, slot=v, shutter=20.0, drive="single")
+    groups, _ = bracket_cycles(b.shots, CycleConfig())
     assert [g.kind for g in groups] == ["exposure"]
 
 

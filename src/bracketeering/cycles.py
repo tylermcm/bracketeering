@@ -32,6 +32,8 @@ class CycleConfig:
     recompose_gap: float = 3.0  # s between frames (end of one exposure to start of the next)...
     rhythm_factor: float = 3.0  # ...and this many times the cycle's typical gap, whichever is longer
     drive_gap: float = 0.7  # s: below this, frames were fired by the drive; never split on looks
+    strong_registration: float = 0.85  # across a pause: previews this alike are the same composition...
+    steady_shift: float = 0.04  # ...or alike (>= SAME_SCENE) at under this shift (fraction of frame)
     session_window: float = 600.0  # s: slots seen this close together form one program
 
 
@@ -112,7 +114,7 @@ def _sessions(shots: list[Shot], cfg: CycleConfig) -> list[list[Shot]]:
     return out
 
 
-def bracket_cycles(shots: list[Shot], cfg: CycleConfig, similar=None) -> tuple[list[Group], list[Shot]]:
+def bracket_cycles(shots: list[Shot], cfg: CycleConfig, similar=None, register=None) -> tuple[list[Group], list[Shot]]:
     """Group slot-bearing frames of one camera (capture order) into brackets.
 
     Returns (groups, remaining shots without slot information). `similar(a, b)` returns a
@@ -150,7 +152,7 @@ def bracket_cycles(shots: list[Shot], cfg: CycleConfig, similar=None) -> tuple[l
     groups: list[Group] = []
     for k, cyc in enumerate(cycles):
         neighbours = [c for c, sid in zip(cycles, session_of) if sid == session_of[k]]
-        for piece in _split_recomposed(cyc, cfg, similar):
+        for piece in _split_recomposed(cyc, cfg, similar, register):
             g = _group(piece, cyc, neighbours, cfg)
             if g.kind == "exposure" and _moving(piece, similar):
                 g.warnings.append("frames don't register (subject or camera moving): an HDR merge may ghost")
@@ -158,16 +160,18 @@ def bracket_cycles(shots: list[Shot], cfg: CycleConfig, similar=None) -> tuple[l
     return groups, rest
 
 
-def _split_recomposed(cycle: list[Shot], cfg: CycleConfig, similar) -> list[list[Shot]]:
+def _split_recomposed(cycle: list[Shot], cfg: CycleConfig, similar, register=None) -> list[list[Shot]]:
     """Split a camera cycle where the shooter recomposed.
 
-    - Across a pause longer than `recompose_gap`, previews must positively match (when known).
-      Without previews: a pause far longer than the cycle's own rhythm. Long exposures and
-      single-frame drive (aurora on a tripod: 30 s exposures, presses 20-60 s apart) have long
-      gaps everywhere, so a pause only counts against the other gaps in the same cycle.
-    - Frames that clearly don't register, but only across a real pause. At drive speed a
-      mismatch means the subject or camera is moving (wildlife), not a new composition:
-      the cycle stays whole and gets flagged.
+    - Within `recompose_gap` (a re-press of a second or two, or drive speed): keep together, unless
+      the previews clearly differ across a non-drive gap. At drive speed a mismatch means the
+      subject or camera is moving (wildlife): the cycle stays whole and gets flagged.
+    - Across a longer pause the shooter had time to recompose, so keep together only on positive
+      evidence: the frames register strongly, or decently at almost the same position (a tripod).
+      Night-sky and foggy recompositions still score 0.5-0.75 overall, but at a large shift.
+      When previews were analysed but one frame is featureless (a black misfire), that is no
+      evidence: split. Without previews at all, fall back to timing: a pause far longer than the
+      cycle's own rhythm (aurora on a tripod has 30-60 s gaps everywhere) splits.
     """
     from .pixels import DIFFERENT, SAME_SCENE
 
@@ -177,12 +181,16 @@ def _split_recomposed(cycle: list[Shot], cfg: CycleConfig, similar) -> list[list
         g = gaps[i]
         others = [x for j, x in enumerate(gaps) if j != i and x is not None]
         rhythm = sorted(others)[len(others) // 2] if others else 0.0
-        sim = similar(a, b) if similar else None
-        if g is not None and g > cfg.recompose_gap and sim is not None:
-            # A real pause: the shooter had time to recompose, so keep the cycle together only
-            # on positive evidence that the frames still register (aurora on a tripod: 0.56-0.99).
-            split = sim < SAME_SCENE
+        analysed = a.pixels is not None and b.pixels is not None
+        if g is not None and g > cfg.recompose_gap and analysed and (register or similar):
+            reg = register(a, b) if register else ((s, 0.0) if (s := similar(a, b)) is not None else None)
+            if reg is None:
+                split = True  # featureless or black frame: nothing says it's the same composition
+            else:
+                score, shift = reg
+                split = not (score >= cfg.strong_registration or (score >= SAME_SCENE and shift <= cfg.steady_shift))
         else:
+            sim = similar(a, b) if similar else None
             long_pause = g is not None and g > max(cfg.recompose_gap, cfg.rhythm_factor * rhythm)
             moved = sim is not None and sim < DIFFERENT and g is not None and g >= cfg.drive_gap
             split = long_pause or moved
