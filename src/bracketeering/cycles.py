@@ -18,7 +18,6 @@ Rules (validated against a hand-checked real shoot, docs/reviews/2026-11-02-chin
 
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import dataclass
 
 from .model import Group, Shot, frame_step
@@ -29,6 +28,7 @@ _MAX_DELETED = 4  # a cycle can survive this many deleted frames inside it
 
 @dataclass(slots=True)
 class CycleConfig:
+    session_break: float = 3600.0  # s: a break this long starts a new bracketing session
     recompose_gap: float = 3.0  # s between frames (end of one exposure to start of the next)...
     rhythm_factor: float = 3.0  # ...and this many times the cycle's typical gap, whichever is longer
     drive_gap: float = 0.7  # s: below this, frames were fired by the drive; never split on looks
@@ -63,20 +63,53 @@ def has_slots(shots: list[Shot]) -> bool:
     return any(_slot(s) is not None for s in shots)
 
 
-def _first_slot(shots: list[Shot], cfg: CycleConfig) -> float:
-    """The slot a cycle starts with: most common slot among frames that clearly begin a cycle."""
-    starts: Counter[float] = Counter()
-    prev = None
+def _order_votes(shots: list[Shot]) -> tuple[int, int]:
+    """(metered-first, under-first) votes from adjacent frames of one cycle.
+
+    Nikon/Canon fire either 0, -, + ("metered first", the default) or -, 0, +. Two consecutive
+    captures that step 0 -> negative only happen in the first order, negative -> 0 only in the
+    second. Unlike counting which slot cycles *start* with, this survives heavy culling: deleting
+    a cycle's first frames leaves its later pairs intact.
+    """
+    metered = under = 0
+    for a, b in zip(shots, shots[1:]):
+        va, vb = _slot(a), _slot(b)
+        if va is None or vb is None or frame_step(a, b) != 1:
+            continue
+        if va == 0 and vb < 0:
+            metered += 1
+        elif va < 0 and vb == 0:
+            under += 1
+    return metered, under
+
+
+def _first_slot(session: list[Shot], camera_votes: tuple[int, int]) -> float:
+    """The slot this bracketing session's cycles start with: 0 unless the camera fired under-first."""
+    metered, under = _order_votes(session)
+    if metered == under:
+        metered, under = camera_votes  # this session has no evidence: use the body's habit
+    if under > metered:
+        return min(v for s in session if (v := _slot(s)) is not None)
+    return 0.0
+
+
+def _sessions(shots: list[Shot], cfg: CycleConfig) -> list[list[Shot]]:
+    """Contiguous runs of bracketing-on frames; a frame with bracketing off, or a long break, ends one."""
+    out: list[list[Shot]] = []
+    current: list[Shot] = []
     for s in shots:
-        v = _slot(s)
-        if v is not None and (prev is None or _slot(prev) is None or (g := _gap(prev, s)) is None or g > cfg.recompose_gap):
-            starts[v] += 1
-        prev = s
-    if not starts:
-        return 0.0
-    best = max(starts.values())
-    tied = [v for v, c in starts.items() if c == best]
-    return 0.0 if 0.0 in tied else min(tied)
+        if _slot(s) is None:
+            if current:
+                out.append(current)
+                current = []
+            continue
+        if current and (g := _gap(current[-1], s)) is not None and g > cfg.session_break:
+            out.append(current)
+            current = []
+        current.append(s)
+    if current:
+        out.append(current)
+    return out
 
 
 def bracket_cycles(shots: list[Shot], cfg: CycleConfig, similar=None) -> tuple[list[Group], list[Shot]]:
@@ -87,40 +120,32 @@ def bracket_cycles(shots: list[Shot], cfg: CycleConfig, similar=None) -> tuple[l
     """
     if not has_slots(shots):
         return [], shots
-    first = _first_slot(shots, cfg)
-    values = sorted({v for s in shots if (v := _slot(s)) is not None} - {first})
-
-    def rank(v: float) -> int:
-        return 0 if v == first else 1 + values.index(v)
-
+    rest = [s for s in shots if _slot(s) is None]
+    camera_votes = _order_votes(shots)
     cycles: list[list[Shot]] = []
-    session_of: list[int] = []  # contiguous run of bracketing-on frames each cycle belongs to
-    session = 0
-    rest: list[Shot] = []
-    current: list[Shot] = []
-    for s in shots:
-        v = _slot(s)
-        if v is None:
+    session_of: list[int] = []  # the bracketing session each cycle belongs to
+    for sid, session in enumerate(_sessions(shots, cfg)):
+        first = _first_slot(session, camera_votes)
+        values = sorted({v for s in session if (v := _slot(s)) is not None} - {first})
+
+        def rank(v: float) -> int:
+            return 0 if v == first else 1 + values.index(v)
+
+        current: list[Shot] = []
+        for s in session:
+            v = _slot(s)
             if current:
-                cycles.append(current)
-                session_of.append(session)
-                current = []
-            session += 1  # bracketing was off for a frame: the program may have changed
-            rest.append(s)
-            continue
+                prev = current[-1]
+                restart = v in {_slot(x) for x in current} or rank(v) <= rank(_slot(prev))  # type: ignore[arg-type]
+                fs = frame_step(prev, s)
+                if restart or (fs is not None and fs > _MAX_DELETED + 1):  # many frames missing between
+                    cycles.append(current)
+                    session_of.append(sid)
+                    current = []
+            current.append(s)
         if current:
-            prev = current[-1]
-            pv = _slot(prev)
-            restart = v in {_slot(x) for x in current} or rank(v) <= rank(pv)  # type: ignore[arg-type]
-            fs = frame_step(prev, s)
-            if restart or (fs is not None and fs > _MAX_DELETED + 1):  # many frames missing between
-                cycles.append(current)
-                session_of.append(session)
-                current = []
-        current.append(s)
-    if current:
-        cycles.append(current)
-        session_of.append(session)
+            cycles.append(current)
+            session_of.append(sid)
 
     groups: list[Group] = []
     for k, cyc in enumerate(cycles):
@@ -136,15 +161,15 @@ def bracket_cycles(shots: list[Shot], cfg: CycleConfig, similar=None) -> tuple[l
 def _split_recomposed(cycle: list[Shot], cfg: CycleConfig, similar) -> list[list[Shot]]:
     """Split a camera cycle where the shooter recomposed.
 
-    - A pause far longer than the cycle's own rhythm. Long exposures and single-frame drive
-      (aurora on a tripod: 30 s exposures, presses 20-60 s apart) have long gaps everywhere,
-      so a pause only counts against the other gaps in the same cycle, and never below
-      `recompose_gap`.
+    - Across a pause longer than `recompose_gap`, previews must positively match (when known).
+      Without previews: a pause far longer than the cycle's own rhythm. Long exposures and
+      single-frame drive (aurora on a tripod: 30 s exposures, presses 20-60 s apart) have long
+      gaps everywhere, so a pause only counts against the other gaps in the same cycle.
     - Frames that clearly don't register, but only across a real pause. At drive speed a
       mismatch means the subject or camera is moving (wildlife), not a new composition:
       the cycle stays whole and gets flagged.
     """
-    from .pixels import DIFFERENT
+    from .pixels import DIFFERENT, SAME_SCENE
 
     gaps = [_gap(a, b) for a, b in zip(cycle, cycle[1:])]
     pieces: list[list[Shot]] = [[cycle[0]]]
@@ -152,10 +177,16 @@ def _split_recomposed(cycle: list[Shot], cfg: CycleConfig, similar) -> list[list
         g = gaps[i]
         others = [x for j, x in enumerate(gaps) if j != i and x is not None]
         rhythm = sorted(others)[len(others) // 2] if others else 0.0
-        long_pause = g is not None and g > max(cfg.recompose_gap, cfg.rhythm_factor * rhythm)
         sim = similar(a, b) if similar else None
-        moved = sim is not None and sim < DIFFERENT and g is not None and g >= cfg.drive_gap
-        if long_pause or moved:
+        if g is not None and g > cfg.recompose_gap and sim is not None:
+            # A real pause: the shooter had time to recompose, so keep the cycle together only
+            # on positive evidence that the frames still register (aurora on a tripod: 0.56-0.99).
+            split = sim < SAME_SCENE
+        else:
+            long_pause = g is not None and g > max(cfg.recompose_gap, cfg.rhythm_factor * rhythm)
+            moved = sim is not None and sim < DIFFERENT and g is not None and g >= cfg.drive_gap
+            split = long_pause or moved
+        if split:
             pieces.append([b])
         else:
             pieces[-1].append(b)

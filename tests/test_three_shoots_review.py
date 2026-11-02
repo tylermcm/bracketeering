@@ -177,3 +177,72 @@ def test_slow_burst_on_a_steady_subject_survives():
     b = Body(model="NIKON Z 7_2")
     names = [b.frame(f"_DSC{705 + i}.NEF", 0 if i == 0 else 0.53, shutter=0.4, focus_distance=3.2) for i in range(3)]
     assert kinds(detect(b.shots), "burst") == [names]
+
+
+# ------------------------------------------------------------------ 0.3.2 re-test
+
+
+def test_culled_session_from_another_trip_doesnt_scramble_bracket_order():
+    """Same D850 in August (heavily culled: cycles start at +2/3, +1, +4/3) and March (aurora)."""
+    b = Body(model="NIKON D850", serial="3014757")
+    # August: surviving tails of 7F cycles at 1/3 EV, shot at drive speed
+    for c, tail in enumerate(((2 / 3, 1), (1, 4 / 3), (2 / 3, 1, 4 / 3), (4 / 3,), (1, 4 / 3))):
+        for i, v in enumerate(tail):
+            b.frame(f"DSC_{100 + 10 * c + i}.NEF", 300 if i == 0 else 0.2, slot=v)
+        b.count += 4  # culled frames
+    b.t += 200 * 86400  # March, next year
+    expected = []
+    for c in range(3):
+        cyc = [b.frame(f"DSC_{1722 + 5 * c + i}.NEF", 300 if i == 0 else 40 + 5 * i, slot=v, shutter=20.0, drive="single")
+               for i, v in enumerate((0, -2 / 3, -1 / 3, 1 / 3, 2 / 3))]
+        expected.append(cyc)
+    groups = detect(b.shots)
+    assert [x for x in kinds(groups, "exposure") if x[0].startswith("DSC_17")] == expected
+
+
+def test_slow_irregular_presses_are_never_a_burst():
+    """_DSC0502-0508: 1.1-2.1 s apart, manual focus, timer off, CL set to 3 fps; 0508 another angle."""
+    b = Body(model="NIKON Z 7_2")
+    b.frame("_DSC0501.NEF", 0)
+    for i, after in enumerate((1.08, 1.09, 1.5, 1.1, 1.11, 1.12)):  # 0.3.2 chained these into a "0.9 fps burst"
+        b.frame(f"_DSC{502 + i:04d}.NEF", after, interval=False)
+    b.frame("_DSC0509.NEF", 30, drive="single")  # the body was also used in single drive
+    assert kinds(detect(b.shots), "burst") == []
+
+
+def test_cycle_split_across_a_long_pause_needs_matching_previews():
+    """Japan DSC_6982/6983: 24 s pause, recomposed; similarity only middling (not a clear mismatch)."""
+    from bracketeering.cycles import CycleConfig, bracket_cycles
+    b = Body(model="NIKON D810")
+    b.frame("DSC_6982.NEF", 0, slot=0, drive="single")
+    b.frame("DSC_6983.NEF", 23.9, slot=-1, drive="single")
+    groups, _ = bracket_cycles(b.shots, CycleConfig(), lambda x, y: 0.42)
+    assert [g.kind for g in groups] == ["single", "single"]
+    groups, _ = bracket_cycles(b.shots, CycleConfig(), lambda x, y: 0.9)  # waterfall, same composition
+    assert [g.kind for g in groups] == ["exposure"]
+
+
+def test_hazy_featureless_views_dont_chain_into_one_scene():
+    """WhiteSands 8475-8501: sunset behind a ridge, hazy dune, ridge, mesa; little detail anywhere."""
+    from bracketeering.pixels import assign_scenes
+    b = Body(model="NIKON Z 7_2")
+    for i in range(4):
+        b.frame(f"_DSC{8475 + 6 * i}.NEF", 0 if i == 0 else 15.0, drive="single")
+    flat = bytes([128]) * (64 * 44)  # featureless structure
+    layouts = [bytes((y * 9 + (x * 7 if k % 2 else 0) + 40 * k) % 200 for y in range(20) for x in range(28)) for k in range(4)]
+    for s, lay in zip(b.shots, layouts):
+        s.pixels = PixelStats(0, 0, 0, 0.5, "ok", flat, lay)
+    g = detect(b.shots)
+    assign_scenes(g)
+    assert len({x.scene for x in g}) > 1
+
+
+def test_jpeg_without_exif_is_a_single_not_an_error(tmp_path):
+    """Bears/Re-edits/PeekingCub.jpg: a Photoshop composite without capture metadata."""
+    pytest.importorskip("PIL")
+    from PIL import Image
+    from bracketeering.metadata.native import read_native
+    p = tmp_path / "PeekingCub.jpg"
+    Image.new("RGB", (64, 48), (90, 120, 60)).save(p, "JPEG")
+    m = read_native(p)
+    assert m.error is None and m.capture_time is None

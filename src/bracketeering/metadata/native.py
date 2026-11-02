@@ -242,7 +242,7 @@ def read_tags(path: Path) -> tuple[dict, dict]:
         if head[:2] == b"\xff\xd8":
             payload = _jpeg_exif(f)
             if payload is None:
-                raise ValueError("no EXIF segment")
+                return {}, {}  # a valid JPEG without EXIF (e.g. a composite export): no metadata, not an error
             return _tiff_tags(io.BytesIO(payload))
         if head[:2] in (b"II", b"MM"):
             return _tiff_tags(f)

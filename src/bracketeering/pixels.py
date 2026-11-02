@@ -176,8 +176,8 @@ def layout_similarity(a, b) -> float | None:
     supports a structural match, never replaces one.
     """
     la, lb = getattr(a.pixels, "layout", None), getattr(b.pixels, "layout", None)
-    if la is None or lb is None or len(la) != len(lb):
-        return None
+    if la is None or lb is None or len(la) != len(lb) or detail(la) < 1.0 or detail(lb) < 1.0:
+        return None  # a uniform frame (all black, blank sky) has no layout to compare
     best = -1.0
     for dy in range(-_LS, _LS + 1):
         for dx in range(-_LS, _LS + 1):
@@ -303,7 +303,11 @@ def _same_scene(prev: Group, g: Group, cfg: PixelConfig) -> tuple[bool, float]:
         if sim >= cfg.weak_similarity and lay is not None and lay >= cfg.layout_similarity and gap is not None and gap <= cfg.layout_window:
             return True, sim
         return False, sim
-    # Featureless frames (moon, black sky): fall back to camera settings and timing.
+    # Featureless frames (moon, black sky, haze): fall back to timing and camera settings, but the
+    # overall layout must match too: low-contrast haze otherwise matches every other hazy view.
+    lay = layout_similarity(sa, sb)
+    if lay is not None and lay < cfg.layout_similarity:
+        return False, -1.0
     ma, mb = sa.meta, sb.meta
     same_lens = (ma.focal_length is None or mb.focal_length is None
                  or abs(ma.focal_length - mb.focal_length) <= 0.05 * max(ma.focal_length, mb.focal_length))
@@ -342,7 +346,12 @@ def assign_scenes(groups: list[Group], cfg: PixelConfig = PixelConfig()) -> None
             if anchor is not None and anchor is not best:
                 a_sim = _looks_alike(anchor, g, cfg)
                 a_lay = layout_similarity(anchor.shots[anchor.representative], g.shots[g.representative])
-                if a_sim is not None and a_sim < cfg.anchor_similarity and (a_lay is None or a_lay < cfg.layout_similarity):
+                layout_differs = a_lay is not None and a_lay < cfg.layout_similarity
+                if a_sim is not None:
+                    unlike = a_sim < cfg.anchor_similarity and (a_lay is None or layout_differs)
+                else:
+                    unlike = layout_differs  # featureless: only the layout can tell
+                if unlike:
                     best = None
         if best is not None:
             g.scene = best.scene

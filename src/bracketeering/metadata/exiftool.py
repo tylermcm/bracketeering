@@ -284,11 +284,7 @@ def _on_off(v) -> bool | None:
 def _record_error(rec: dict) -> str | None:
     """exiftool's own verdict that a file isn't a usable image (e.g. "Entire file is binary zeros")."""
     err = rec.get("Error")
-    if err:
-        return str(err)
-    if not any(rec.get(k) for k in ("Make", "Model", "DateTimeOriginal", "ExposureTime")):
-        return "no image metadata (empty, truncated or not an image file?)"
-    return None
+    return str(err) if err else None  # an image without camera metadata is fine: it becomes a single
 
 
 def _shutter_count(rec: dict) -> int | None:

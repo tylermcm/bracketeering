@@ -80,6 +80,7 @@ class BurstModel:
     # moving subject or a fast-changing scene also fails to register; one hold stays one burst
     hash_same_max: int = 12
     refocus: float = 1.5  # focus distance jumped between frames at a slow pace (penalty)
+    hash_change_slow: float = 4.0  # previews don't register at a slow pace (penalty)
     refocus_ratio: float = 1.4
     slow_pace: float = 0.5  # s: intervals at least this long count as a slow pace
     hash_change_min: int = 24
@@ -252,7 +253,8 @@ def _pairs(chain: list[Shot], cfg: BurstConfig) -> list[_Pair]:
             if not change and _alike(a, b, m):
                 meta += m.hash_same
             elif change:
-                meta -= m.hash_change
+                # At drive speed a mismatch is a moving subject; at a slow pace it's a new shot.
+                meta -= m.hash_change if iv is None or iv < m.slow_pace else m.hash_change_slow
                 cand = True
         precise = ma.time_precise and mb.time_precise and iv is not None
         if not precise:
@@ -328,7 +330,7 @@ def _piece(chain: list[Shot], pairs: list[_Pair], lo: int, hi: int, m: BurstMode
     if all(p.precise for p in seg):
         ivs = [max(p.interval, 0.002) for p in seg]  # type: ignore[type-var]
         cadence = median(ivs)
-        if cadence > m.max_drive_interval * 1.15:
+        if cadence > m.max_drive_interval:
             return _Piece(-math.inf, cadence)  # slower than any continuous drive: separate presses
         score = _ln_drive_prior(cadence, m)  # explains one interval; local jitter the other n-2
         if len(ivs) > 1:
@@ -408,8 +410,9 @@ def segment_chain(chain: list[Shot], cfg: BurstConfig) -> list[Group]:
                 v = prev + (_break(lp, m) if lp else 0.0) + contrib
                 if v > best_b[j]:
                     best_b[j], back_b[j] = v, (i, prev_state, "N", piece.cadence, contrib)
-            # C: the same press continues at a new cadence
-            if lp is not None and not lp.hard_split and best_b[i] > NEG:
+            # C: the same press continues at a new cadence. Needs 3+ frames to establish the new
+            # pace: otherwise any slow irregular presses chain as 2-frame "pace changes".
+            if lp is not None and not lp.hard_split and best_b[i] > NEG and hi - plo + 1 >= 3:
                 contrib = _drive(lp, piece.cadence, m) + lp.meta - m.pace_change + piece.score
                 v = best_b[i] + contrib
                 if v > best_b[j]:
