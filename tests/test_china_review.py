@@ -173,3 +173,126 @@ def test_scene_survives_drift_and_one_odd_frame():
     scenes = [grp.scene for grp in groups]
     assert len({sc for i, sc in enumerate(scenes) if i != 4}) == 1
     assert scenes[4] != scenes[0]
+
+
+# ----------------------------------------------------------------- second review (0.3.0 re-test)
+
+def _partial(groups, first):
+    g = next(g for g in groups if g.kind == "exposure" and g.shots[0].name == first)
+    return [w for w in g.warnings if w.startswith("partial")]
+
+
+def test_complete_cycles_are_not_called_partial():
+    """3F cycles next to a 5F session, and 1-EV cycles next to a 2/3-EV session, are complete."""
+    s = Shoot()
+    # in the camera's firing order: metered slot, then darkest to brightest (0, -4/3, -2/3, +2/3, +4/3)
+    for k, slots in enumerate(((0, -2 / 3, 2 / 3), (0, -4 / 3, -2 / 3, 2 / 3, 4 / 3), (0, -2, -1, 1, 2), (0, -2 / 3, 2 / 3))):
+        for i, v in enumerate(slots):
+            s.frame(1224 + 10 * k + i, 30 if i == 0 else 0.15, slot=v)
+    g = detect(s.shots)
+    assert len([x for x in g if x.kind == "exposure"]) == 4
+    for k in range(4):
+        assert _partial(g, f"_DSC{1224 + 10 * k}.NEF") == []
+
+
+def test_partial_cycles_are_flagged_with_the_right_size(shoot):
+    g = detect(shoot.shots)
+    assert _partial(g, "_DSC1700.NEF") == ["partial bracket: 2 of 5 slots"]  # 0, -4/3 in a 2/3-EV 5F session
+    assert _partial(g, "_DSC1703.NEF") == ["partial bracket: 3 of 5 slots"]
+
+
+def test_camera_program_setting_wins():
+    s = Shoot()
+    for i, v in enumerate((0, -1, 1)):
+        s.frame(1300 + i, 0 if i == 0 else 0.15, slot=v)
+        s.shots[-1].meta.bracket_program = 5  # exiftool BracketProgram "5F"
+    assert _partial(detect(s.shots), "_DSC1300.NEF") == ["partial bracket: 3 of 5 slots"]
+
+
+def test_slow_separate_presses_in_continuous_drive_are_not_a_burst():
+    """Body left in continuous drive all day: _DSC0600-0604 (~2 s apart), _DSC1073-1075 (~0.8 s)."""
+    s = Shoot()
+    for i, (after, iso) in enumerate(zip((0, 2.1, 1.9, 2.0, 2.2), (2000, 3600, 2200, 2500, 2500))):
+        s.frame(600 + i, after, iso=float(iso))
+    s.frame(1073, 60)
+    s.frame(1074, 0.82)
+    s.frame(1075, 0.77)
+    # _DSC0705-0707: 0.4 s exposures fired every 0.53 s, constant settings: a real slow burst
+    s.frame(705, 60, shutter=0.4)
+    s.frame(706, 0.53, shutter=0.4)
+    s.frame(707, 0.53, shutter=0.4)
+    g = detect(s.shots)
+    assert groups_by_kind(g, "burst") == [["_DSC705.NEF", "_DSC706.NEF", "_DSC707.NEF"]]
+
+
+PIL = pytest.importorskip("PIL")
+
+
+def _world(seed: int, w: int = 1600, h: int = 700):
+    """A wide synthetic place: sky, structures with windows, foliage texture."""
+    import random
+    from PIL import Image, ImageDraw
+    rng = random.Random(seed)
+    im = Image.new("L", (w, h))
+    d = ImageDraw.Draw(im)
+    for y in range(h):
+        d.line([(0, y), (w, y)], fill=int(170 - 60 * y / h) if y < h * 0.55 else 70)
+    for _ in range(25):
+        x, bw, top = rng.randrange(w), rng.randrange(30, 160), rng.randrange(int(h * 0.15), int(h * 0.5))
+        d.rectangle([x, top, x + bw, int(h * 0.6)], fill=rng.randrange(30, 200))
+        for _ in range(rng.randrange(0, 6)):
+            wx, wy = x + rng.randrange(max(1, bw - 10)), top + rng.randrange(max(1, int(h * 0.6) - top - 10))
+            d.rectangle([wx, wy, wx + 8, wy + 12], fill=rng.randrange(0, 255))
+    for _ in range(3000):
+        x, y, r = rng.randrange(w), rng.randrange(int(h * 0.55), h), rng.randrange(2, 6)
+        d.ellipse([x - r, y - r, x + r, y + r], fill=rng.randrange(20, 140))
+    return im
+
+
+def _view(world, x0: int, exposure: float = 1.0) -> bytes:
+    from bracketeering.pixels import band_pass
+    fw = 720
+    im = world.crop((x0, 110, x0 + fw, 110 + 480)).resize((600, 400))
+    if exposure != 1.0:
+        im = im.point(lambda p: max(0, min(255, int(p * exposure))))
+    return band_pass(im)
+
+
+def test_similarity_separates_drift_from_recompose():
+    from bracketeering.pixels import DIFFERENT, SAME_SCENE, thumb_similarity
+    w = _world(1)
+    base = _view(w, 300)
+    for drifted in (_view(w, 322), _view(w, 343), _view(w, 357, exposure=0.4), _view(w, 300, exposure=2.0)):
+        assert thumb_similarity(base, drifted) >= SAME_SCENE  # 3-8 % handheld drift, bracket exposures
+    for other in (_view(w, 559), _view(w, 444), _view(_world(2), 300)):
+        assert thumb_similarity(base, other) < DIFFERENT  # 36 % / 20 % recompose, another place
+
+
+def test_quick_recompose_splits_a_bracket_cycle():
+    """DSC_1254 -> 1255: 36 % recompose only 1.6 s apart (0.3.0 scored it +0.657 and kept the cycle)."""
+    w = _world(3)
+    s = Shoot()
+    s.frame(1254, 0, slot=0)
+    s.frame(1255, 1.6, slot=-2 / 3)
+    s.frame(1256, 0.2, slot=2 / 3)
+    for shot, thumb in zip(s.shots, (_view(w, 300), _view(w, 559, 0.6), _view(w, 565, 1.6))):
+        _with_thumb(shot, thumb)
+    g = detect(s.shots)
+    assert groups_by_kind(g, "exposure") == [["_DSC1255.NEF", "_DSC1256.NEF"]]
+    assert groups_by_kind(g, "single") == [["_DSC1254.NEF"]]
+
+
+def test_scene_does_not_chain_across_subjects():
+    """Scene 195: a slow walk around a statue chained 41 groups / 4 subjects via the last-4 lookback."""
+    from bracketeering.pixels import assign_scenes
+    w = _world(4, w=3200)
+    s = Shoot()
+    xs = [100 + 70 * i for i in range(24)]  # each view drifts ~10 % from the last; 0 and 23 share nothing
+    for i in range(len(xs)):
+        s.frame(1198 + i, 0 if i == 0 else 6.0 + (i % 3), drive="single")
+    groups = detect(s.shots)
+    for grp, x in zip(groups, xs):
+        _with_thumb(grp.shots[0], _view(w, x))
+    assign_scenes(groups)
+    first, last = groups[0].scene, groups[-1].scene
+    assert first != last

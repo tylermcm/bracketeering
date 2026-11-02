@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from statistics import median
 
@@ -653,6 +653,7 @@ def detect(shots: list[Shot], cfg: EngineConfig | None = None) -> list[Group]:
     for cam_shots in by_cam.values():
         cam_shots.sort(key=_order_key)
         ctx = _CameraContext(reports_aeb=any(s.meta.exposure_mode == 2 for s in cam_shots))
+        cam_shots_all = cam_shots
         maker_groups, cam_shots = bracket_cycles(cam_shots, cfg.cycles, similarity)
         runs = split_runs(cam_shots, cfg)
         cache: _Cache = {}  # group evaluations keyed by (first shot, size); shots outlive the call
@@ -666,7 +667,8 @@ def detect(shots: list[Shot], cfg: EngineConfig | None = None) -> list[Group]:
         if cfg.detect_timelapse:  # before bursts: regular at >= 1 s is a timer, not a drive
             groups = form_timelapses(groups, cfg.timelapse)
         if cfg.detect_bursts:
-            groups = form_bursts(groups, cfg.bursts)
+            modes = {s.meta.drive_mode for s in cam_shots_all if s.meta.drive_mode}
+            groups = form_bursts(groups, replace(cfg.bursts, drive_informative=len(modes) > 1))
         result.extend(groups)
     result.sort(key=lambda g: _order_key(g.shots[0]))
     for g in result:

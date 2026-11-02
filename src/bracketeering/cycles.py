@@ -135,13 +135,34 @@ def _split_recomposed(cycle: list[Shot], cfg: CycleConfig, similar) -> list[list
     return pieces
 
 
-def _program_size(piece: list[Shot], all_shots: list[Shot], cfg: CycleConfig) -> int:
+def _program_size(piece: list[Shot], all_shots: list[Shot], cfg: CycleConfig) -> int | None:
+    """Frames in this cycle's bracket program, or None when it can't be known reliably.
+
+    The camera's own setting wins (Nikon BracketProgram via exiftool). Otherwise it is inferred from
+    the slots themselves: programs are evenly spaced, so a cycle reaching +-k steps from the metered
+    slot has 2k+1 frames (symmetric) or k+1 (one-sided). The step comes from the cycle when it shows
+    two slot spacings, else from neighbouring cycles (a 0 / -4/3 pair alone can't tell 3F from 5F).
+    """
+    programs = [s.meta.bracket_program for s in piece if s.meta.bracket_program]
+    if programs:
+        return max(programs)
+    slots = sorted({_slot(s) for s in piece} - {None})  # type: ignore[type-var]
+    if 0.0 not in slots or len(slots) < 2:
+        return None
     t0 = piece[0].time
-    vals = {
+    nearby = [
         v for s in all_shots
         if (v := _slot(s)) is not None and (t0 is None or s.time is None or abs(s.time - t0) <= cfg.session_window)
-    }
-    return max(len(vals), len(piece))
+    ]
+    step = min(b - a for a, b in zip(slots, slots[1:]))
+    if len({abs(v) for v in slots if v}) < 2:
+        step = min({abs(v) for v in nearby if v} | {step})
+    reach = round(max(abs(v) for v in slots) / step)
+    # One-sided programs (Nikon 2F+/3F-, ...) only when neighbouring cycles are one-sided too:
+    # 0, -4/3, -2/3 is a complete "3F-" or 3 frames of a 5F, and the session tells which.
+    if all(v >= 0 for v in nearby) or all(v <= 0 for v in nearby):
+        return reach + 1
+    return 2 * reach + 1
 
 
 def _group(piece: list[Shot], all_shots: list[Shot], cfg: CycleConfig) -> Group:
@@ -157,6 +178,6 @@ def _group(piece: list[Shot], all_shots: list[Shot], cfg: CycleConfig) -> Group:
     if gaps and max(gaps) > 0.6:
         evidence.append(f"shot across re-presses (longest pause {max(gaps):.1f} s), one composition")
     warnings = []
-    if len(piece) < program:
+    if program is not None and len(piece) < program:
         warnings.append(f"partial bracket: {len(piece)} of {program} slots")
     return Group("exposure", piece, score=10.0, confidence=0.99, evidence=evidence, warnings=warnings)

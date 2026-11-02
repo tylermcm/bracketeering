@@ -55,6 +55,7 @@ class FileMeta:
     bracket_kind: str | None = None  # "exposure", "focus", "flash", "wb", "iso", "none"
     bracket_position: int | None = None  # 1-based position within a bracket
     bracket_value: float | None = None  # this frame's slot in the camera's bracket program, EV (maker notes)
+    bracket_program: int | None = None  # frames per bracket cycle the camera was set to (Nikon BracketProgram)
     drive_mode: str | None = None  # "continuous" or "single" (maker notes)
     shutter_count: int | None = None  # body's actuation counter (maker notes): identifies a capture
     utc_offset: float | None = None  # seconds east of UTC that the camera's local time was in

@@ -28,7 +28,7 @@ TAGS = [
     "-EXIF:ExposureMode#", "-ExposureProgram#", "-FocalLength#", "-EXIF:WhiteBalance#",
     "-Flash#", "-FocusDistance#", "-SubjectDistance#", "-ApproximateFocusDistance#",
     "-*Bracket*", "-SequenceNumber", "-*ShotNumber*", "-DriveMode", "-ReleaseMode*",
-    "-ShootingMode", "-FocusShift*", "-ContinuousDrive", "-BurstMode", "-ExposureBracketValue#",
+    "-ShootingMode", "-FocusShift*", "-ContinuousDrive", "-BurstMode", "-ExposureBracketValue#", "-BracketProgram",
     "-ShutterCount", "-ImageCount",
 ]
 
@@ -184,6 +184,15 @@ def classify_bracket(record: dict) -> tuple[str | None, int | None]:
     return ("none" if saw_off else None), None
 
 
+def bracket_program(record: dict) -> int | None:
+    """Frames per cycle the camera was set to bracket (Nikon BracketProgram "5F", "3F", "2F+", ...)."""
+    for key, value in record.items():
+        if key.lower() == "bracketprogram" and (m := re.match(r"\s*(\d+)\s*F", str(value), re.I)):
+            n = int(m.group(1))
+            return n if n >= 2 else None
+    return None
+
+
 def bracket_slot(record: dict) -> float | None:
     """This frame's offset within the camera's bracket program (Nikon ExposureBracketValue), in EV."""
     for key, value in record.items():
@@ -245,6 +254,7 @@ def meta_from_record(rec: dict) -> FileMeta:
         drive_mode=drive,
         sequence_number=seq,
         bracket_value=bracket_slot(rec) if kind == "exposure" else None,
+        bracket_program=bracket_program(rec) if kind == "exposure" else None,
         shutter_count=_shutter_count(rec),
         utc_offset=_offset_seconds(rec.get("OffsetTimeOriginal")),
         reader="exiftool",

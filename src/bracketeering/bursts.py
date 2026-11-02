@@ -97,6 +97,9 @@ class BurstConfig:
     focal_tol: float = 0.02
     max_frame_skip: int = 3
     model: BurstModel = field(default_factory=BurstModel)
+    # Set per camera: "continuous drive" is evidence only if the body was also used in single drive.
+    # Many shooters leave continuous on all day, and then every frame says so.
+    drive_informative: bool = True
 
 
 def _ln_norm(x: float, mu: float, sd: float) -> float:
@@ -196,6 +199,7 @@ class _Pair:
     precise: bool  # both timestamps have sub-seconds
     same_second_run: int = 0  # whole-second stamps: how many consecutive 0 s steps end here
     subject_change: bool = False  # previews look different (pixels)
+    exposure: float = 0.0  # exposure time of the first frame: a person can only re-press after it ends
 
 
 def _pairs(chain: list[Shot], cfg: BurstConfig) -> list[_Pair]:
@@ -226,7 +230,7 @@ def _pairs(chain: list[Shot], cfg: BurstConfig) -> list[_Pair]:
                 cand = True
         elif sb == 1:
             cand = True
-        if ma.drive_mode == "continuous" and mb.drive_mode == "continuous":
+        if ma.drive_mode == "continuous" and mb.drive_mode == "continuous" and cfg.drive_informative:
             meta += m.drive_continuous
         elif "single" in (ma.drive_mode, mb.drive_mode):
             meta -= m.drive_single
@@ -244,7 +248,7 @@ def _pairs(chain: list[Shot], cfg: BurstConfig) -> list[_Pair]:
         run = 0
         if not precise and iv is not None and round(iv) == 0:
             run = (out[-1].same_second_run if out and not out[-1].precise else 0) + 1
-        out.append(_Pair(iv, meta, hard, cand, precise, run, bool(change)))
+        out.append(_Pair(iv, meta, hard, cand, precise, run, bool(change), ma.exposure_time or 0.0))
     # timing: an interval far off its neighbours' cadence may be a boundary or a pace change
     # (measured on dead time when slow shutters dominate the interval)
     ivs = [p.interval for p in out]
@@ -273,7 +277,9 @@ def _break(p: _Pair, m: BurstModel) -> float:
         # The camera swung to a new subject: a boundary at drive speed, not a human pause.
         return 0.0
     if p.precise:
-        return _ln_break(p.interval, m)
+        # The pause a person needs runs from the end of the exposure: 0.4 s exposures fired
+        # 0.53 s apart leave 0.13 s, far too quick for a release and re-press.
+        return _ln_break(max(p.interval - p.exposure, 0.001), m)
     d = round(p.interval)
     if d <= 0:
         # Each further separate press landing in the same second is rarer than the last.
@@ -313,6 +319,8 @@ def _piece(chain: list[Shot], pairs: list[_Pair], lo: int, hi: int, m: BurstMode
     if all(p.precise for p in seg):
         ivs = [max(p.interval, 0.002) for p in seg]  # type: ignore[type-var]
         cadence = median(ivs)
+        if cadence > m.max_drive_interval * 1.15:
+            return _Piece(-math.inf, cadence)  # slower than any continuous drive: separate presses
         score = _ln_drive_prior(cadence, m)  # explains one interval; local jitter the other n-2
         if len(ivs) > 1:
             # With slow shutters the drive fires "exposure + fixed overhead" apart, so

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import io
 import math
+from array import array
 from functools import lru_cache
 import operator
 import os
@@ -41,7 +42,8 @@ class PixelConfig:
     scene_window: float = 120.0  # s: max pause between groups of one near-duplicate scene
     scene_lookback: int = 4  # compare with this many recent groups, not just the previous one
     hash_threshold: int = 12  # dHash fallback only: bits (of 64) that map to scene_similarity
-    scene_similarity: float = 0.6  # preview similarity (-1..1) at or above which groups are one scene
+    scene_similarity: float = 0.5  # preview similarity (-1..1) at or above which groups are one scene (= SAME_SCENE)
+    anchor_similarity: float = 0.35  # ...and never links a group clearly unlike the scene's first one (= DIFFERENT)
 
 
 @dataclass(slots=True, frozen=True)
@@ -60,40 +62,79 @@ class PixelStats:
 
 # --------------------------------------------------------------------------- similarity
 #
-# Two frames of one composition taken handheld drift by a few % of the frame and may differ in
-# exposure. dHash compares fixed pixel positions, so on fine texture (foliage, ivy, fog) such a drift
-# flips many bits. Instead, compare small grayscale thumbnails by normalised cross-correlation at
-# the best of a few small shifts: invariant to brightness/contrast (exposure brackets), tolerant to
-# drift up to SHIFT/INNER_W of the frame, and blurred enough that fine texture doesn't dominate.
+# "Same composition, drifted a bit" vs "recomposed / different subject". Whole-image correlation at
+# low resolution mostly compares layout (sky above, ground below), which a recompose of the same
+# place keeps, and dHash flips bits on fine texture. Instead, like phase correlation, compare
+# *structure*: band-pass the thumbnail (keep detail at the scale of objects, drop overall
+# brightness/layout and pixel-level texture), then take the best normalised cross-correlation over
+# shifts of up to ~12 % of the frame (coarse search at half resolution, refined at full). Frames that
+# register score high; recomposed frames and other subjects don't. Brightness/contrast changes
+# (exposure brackets) cancel out in the normalisation.
 
-THUMB_W, THUMB_H = 28, 20
-SHIFT = 2  # pixels each way: +-2/24 = +-8 % of the frame width
-INNER_W, INNER_H = THUMB_W - 2 * SHIFT, THUMB_H - 2 * SHIFT
-SAME_SCENE = 0.6  # similarity at or above: same composition / subject
+THUMB_W, THUMB_H = 64, 44
+COARSE = 2  # coarse search at 1/COARSE resolution
+SHIFT = 4  # coarse pixels each way at 32x22: +-4/32 = +-12 % of the frame
+SAME_SCENE = 0.5  # similarity at or above: same composition / subject
 DIFFERENT = 0.35  # similarity below: recomposed or a different subject
 
 
-@lru_cache(maxsize=65536)
-def _window(thumb: bytes, dx: int, dy: int) -> tuple[float, ...]:
-    vals: list[float] = []
-    for y in range(SHIFT + dy, SHIFT + dy + INNER_H):
-        row = y * THUMB_W + SHIFT + dx
-        vals.extend(thumb[row : row + INNER_W])
+def band_pass(gray) -> bytes:
+    """THUMB_W x THUMB_H band-passed thumbnail of a grayscale PIL image (128 = no structure)."""
+    from PIL import Image, ImageChops, ImageFilter
+
+    small = gray.resize((THUMB_W, THUMB_H), Image.Resampling.BOX).filter(ImageFilter.GaussianBlur(0.7))
+    return ImageChops.subtract(small, small.filter(ImageFilter.BoxBlur(4)), scale=1, offset=128).tobytes()
+
+
+@lru_cache(maxsize=8192)
+def _coarse(thumb: bytes) -> bytes:
+    w, h = THUMB_W // COARSE, THUMB_H // COARSE
+    out = bytearray()
+    for y in range(h):
+        r0, r1 = 2 * y * THUMB_W, (2 * y + 1) * THUMB_W
+        for x in range(w):
+            c = 2 * x
+            out.append((thumb[r0 + c] + thumb[r0 + c + 1] + thumb[r1 + c] + thumb[r1 + c + 1]) // 4)
+    return bytes(out)
+
+
+@lru_cache(maxsize=2048)  # ~12 KB per fine window: bounded memory on any shoot size
+def _window(img: bytes, width: int, margin_x: int, margin_y: int, dx: int, dy: int) -> array:
+    """Mean-removed, unit-norm window of `img` (row width `width`) inset by the margins, shifted."""
+    height = len(img) // width
+    vals: list[int] = []
+    for y in range(margin_y + dy, height - margin_y + dy):
+        row = y * width
+        vals.extend(img[row + margin_x + dx : row + width - margin_x + dx])
     n = len(vals)
     mean = sum(vals) / n
     centred = [v - mean for v in vals]
     norm = math.sqrt(sum(v * v for v in centred)) or 1.0
-    return tuple(v / norm for v in centred)
+    return array("d", (v / norm for v in centred))
+
+
+def _ncc(a: bytes, b: bytes, width: int, margin_x: int, margin_y: int, dx: int, dy: int) -> float:
+    return sum(map(operator.mul, _window(a, width, margin_x, margin_y, 0, 0), _window(b, width, margin_x, margin_y, dx, dy)))
 
 
 def thumb_similarity(a: bytes, b: bytes) -> float:
-    """Best normalised cross-correlation of two thumbnails over small shifts (-1..1)."""
-    ref = _window(a, 0, 0)
-    best = -1.0
-    for dy in range(-SHIFT, SHIFT + 1):
+    """How well two band-passed thumbnails register (-1..1), allowing ~12 % drift."""
+    if len(a) != len(b) or len(a) != THUMB_W * THUMB_H:
+        return -1.0
+    ca, cb = _coarse(a), _coarse(b)
+    cw = THUMB_W // COARSE
+    best, bx, by = -2.0, 0, 0
+    for dy in range(-SHIFT // 2, SHIFT // 2 + 1):  # frames drift sideways more than vertically
         for dx in range(-SHIFT, SHIFT + 1):
-            best = max(best, sum(map(operator.mul, ref, _window(b, dx, dy))))
-    return best
+            v = _ncc(ca, cb, cw, SHIFT, SHIFT // 2, dx, dy)
+            if v > best:
+                best, bx, by = v, dx, dy
+    fine = -2.0
+    mx, my = SHIFT * COARSE + 1, (SHIFT // 2) * COARSE + 1
+    for dy in range(by * COARSE - 1, by * COARSE + 2):
+        for dx in range(bx * COARSE - 1, bx * COARSE + 2):
+            fine = max(fine, _ncc(a, b, THUMB_W, mx, my, dx, dy))
+    return fine
 
 
 def similarity(a, b) -> float | None:
@@ -151,7 +192,7 @@ def analyse_file(path: Path, cfg: PixelConfig = PixelConfig()) -> PixelStats | N
         flag = "under"
     else:
         flag = "ok"
-    thumb = gray.resize((THUMB_W, THUMB_H), Image.Resampling.BOX).tobytes()
+    thumb = band_pass(gray)
     return PixelStats(_dhash(gray), highlights, shadows, mean, flag, thumb)
 
 
@@ -215,6 +256,7 @@ def assign_scenes(groups: list[Group], cfg: PixelConfig = PixelConfig()) -> None
     walking through) doesn't cut a scene in two. The best match above SAME_SCENE wins.
     """
     recent: dict[tuple, list[Group]] = {}
+    anchors: dict[int, Group] = {}  # scene id -> its first group
     next_id = 1
     threshold = cfg.scene_similarity
     for g in sorted(groups, key=lambda g: (g.shots[0].time is None, g.shots[0].time or 0.0, g.shots[0].name)):
@@ -230,8 +272,14 @@ def assign_scenes(groups: list[Group], cfg: PixelConfig = PixelConfig()) -> None
             if sim is not None and sim >= best_sim:
                 best, best_sim = prev, sim
         if best is not None:
+            # Guard against chaining: A~B, B~C, C~D can walk across subjects over many minutes.
+            anchor_sim = _looks_alike(anchors[best.scene], g, cfg) if best.scene in anchors else None  # type: ignore[index]
+            if anchor_sim is not None and anchor_sim < cfg.anchor_similarity:
+                best = None
+        if best is not None:
             g.scene = best.scene
         else:
             g.scene = next_id
+            anchors[next_id] = g
             next_id += 1
         window.append(g)

@@ -98,7 +98,7 @@ from bracketeering.report import to_dict    # the SCHEMA.md structure, ready for
 3. **Camera bracket cycles** (`cycles.py`). When the camera recorded each frame's bracket slot, brackets are rebuilt from those slots rather than inferred from measured exposure. With Auto ISO the camera re-meters on every press, so a 0 / −4/3 / −2/3 cycle can *measure* +0.85 / −0.64 / 0.
    - **New cycle:** slots follow the program order (metered slot first by default). A repeated or earlier slot starts a new cycle: a re-press restart, or the tail of a cycle whose first frames were deleted.
    - **Recompose split:** a cycle splits where the shooter recomposed, either a pause over 3 s or (with `--pixels`) clearly different previews. Re-presses of a second or two on one composition stay together.
-   - **Offsets:** they're the camera's own (`[0, -1.33, -0.67]`), the representative is the metered frame, and partial cycles are flagged ("partial bracket: 3 of 5 slots").
+   - **Offsets:** they're the camera's own (`[0, -1.33, -0.67]`), the representative is the metered frame, and partial cycles are flagged ("partial bracket: 3 of 5 slots"). The program size comes from the camera's `BracketProgram` setting when exiftool provides it. Otherwise it's inferred from the slots: programs are evenly spaced, so a cycle reaching ±k steps has 2k+1 frames, and neighbouring cycles tell symmetric programs from one-sided ones.
    - **Bracketing off:** frames the camera recorded with bracketing *off* can never be grouped as a bracket.
 4. **Split into runs** per camera body, for frames without bracket slots. A run is a chain of consecutive frames with the same lens and focal length and comparable exposure data. Each frame must start within `max_gap` of the *end* of the previous exposure, so long-exposure brackets work. Large frame-counter jumps also end a run.
 5. **Carve out focus stacks.** These are constant-exposure blocks flagged by maker notes, or with monotonic focus distance.
@@ -117,7 +117,7 @@ from bracketeering.report import to_dict    # the SCHEMA.md structure, ready for
    - Both sides are densities over the same intervals, so dynamic programming finds the most likely labelling: which frames are bursts, and exactly where each burst starts and ends.
    - A burst may **change pace** without splitting (a 20 fps burst that drops to 5 fps when the buffer fills, or zooming). An interval at the *new* pace is a drive interval; a pause that fits neither pace is a re-press.
    - With slow shutters, the drive fires "exposure + fixed overhead" apart, so regularity is judged on the dead time between frames.
-   - **Metadata** (with `--backend exiftool`): continuous vs single drive, and the burst **sequence number**, where a reset to 1 forces a new burst. That separates back-to-back presses even without sub-second times. Zoom changes, exposure jumps and frame-counter gaps count against "same press".
+   - **Metadata** (Nikon natively, other makes with `--backend exiftool`): continuous vs single drive, and the burst **sequence number**, where a reset to 1 forces a new burst. That separates back-to-back presses even without sub-second times. Zoom changes, exposure jumps and frame-counter gaps count against "same press". Drive mode counts only when the body was used in both modes; many people leave continuous drive on all day, and then it says nothing. A pace slower than ~1 fps is never a burst, and a human re-press is timed from the *end* of the exposure.
    - **Pixels** (with `--pixels`): a subject change between consecutive previews splits a burst, even at full drive speed.
    - **Coarse timestamps:** without sub-seconds, the model uses the probability of landing in the same or next second, a decaying probability for several separate presses within one second, and an edge prior (a separate press right next to a running burst is unlikely).
    - **Confidence** is the log-odds of "one press" vs "separate presses". On simulated shoots, bursts at ≥ 0.9 were exactly right 95% of the time.
@@ -125,8 +125,10 @@ from bracketeering.report import to_dict    # the SCHEMA.md structure, ready for
 11. **Pixels (optional).** Embedded previews are found in each container (JPEG `APP1`, TIFF/NEF/ARW/DNG/CR2 preview IFDs and SubIFDs, RW2 `JpgFromRaw`, RAF, CR3 `PRVW`). Lossless-JPEG raw data is skipped. Each preview is decoded at reduced size, and the engine computes:
    - **Exposure stats** per frame: highlight clipping (any channel ≥ 250), crushed shadows, mean level, and an `ok`/`over`/`under` flag.
    - **`best_exposed`** per bracket: the brightest frame whose highlights hold (≤ 0.5% clipped), i.e. expose to the right. Of the usable frames it has the cleanest shadows.
-   - **Preview similarity:** small grayscale thumbnails are compared by normalised cross-correlation at the best of a few small shifts. This tolerates handheld drift up to ~8 % of the frame and is unaffected by exposure differences, so bracket frames still match. The thumbnail is blurred enough that fine texture (foliage, ivy, fog) doesn't dominate. dHash, used before, flipped 13–29 of 64 bits on such textures for the same composition.
-   - **Near-duplicate scenes:** each group's representative is compared with the last 4 groups from the same body within `scene_window`, not just the previous one, so one odd frame doesn't cut a scene in two. Groups at or above `--scene-similarity` (0.6) share a scene.
+   - **Preview similarity** answers "do these two frames register?", like phase correlation. A 64×44 thumbnail is band-passed, keeping structure at the scale of objects and dropping overall layout, brightness and pixel-level texture. The best normalised cross-correlation is then found over shifts up to ~12 % of the frame (coarse search, then refined). Same composition with handheld drift or a different exposure scores ~0.95; a 20–60 % recompose or another place scores ~0.15–0.25.
+     - Plain low-resolution correlation compares layout (sky above, ground below), which a recompose keeps. Version 0.3.0 used it and scored a 36 % recompose at +0.66.
+     - dHash flips bits on fine texture (foliage, ivy, fog).
+   - **Near-duplicate scenes:** each group's representative is compared with the last 4 groups from the same body within `scene_window`, not just the previous one, so one odd frame doesn't cut a scene in two. Groups at or above `--scene-similarity` (0.5) share a scene. A scene also never takes in a group clearly unlike its *first* group, so a slow walk around a subject can't chain into one long scene.
    - **Bursts and bracket cycles** also use the similarity: below 0.35 counts as a subject change (bursts) or a recompose (bracket cycles).
 
 ## Accuracy
@@ -202,7 +204,7 @@ src/bracketeering/
 
 - Times in reports are camera-local, with the UTC offset when the file records one (`OffsetTimeOriginal`).
 - The native reader decodes Nikon maker notes only. For other makes, maker-note bracket and drive tags need `--backend exiftool`; without them, detection works from EXIF and exposure analysis.
-- The similarity thresholds (0.6 same scene, 0.35 different) are first estimates. `scripts/similarity_pairs.py` prints the similarity of frame pairs, for calibrating on real shoots.
+- The similarity thresholds (0.5 same scene, 0.35 different) are set from synthetic textured scenes and not yet calibrated on real photos. `scripts/similarity_pairs.py` prints the similarity of frame pairs, for calibrating on real shoots.
 - HEIC/HEIF and less common RAW containers fall back to exiftool when it's installed. Without exiftool, they're reported as unreadable.
 - White-balance and flash brackets are not grouped as exposure brackets. ISO brackets (auto-ISO AEB) are.
 - ⅓-stop brackets need metadata support (EXIF auto-bracket flag, maker notes or matching exposure compensation). Without it, a ⅓-stop series looks the same as metering drift in a burst, so it is never grouped as a bracket.
