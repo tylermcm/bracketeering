@@ -55,6 +55,10 @@ class EngineConfig:
     min_focus_frames_inferred: int = 5  # inferred from focus distance alone
     focus_max_gap: float = 1.5
     use_prior: bool = True
+    detect_bursts: bool = True
+    burst_max_gap: float = 1.0  # s between frames of a burst (end of one exposure to start of next)
+    min_burst: int = 2
+    min_confidence: float = 0.5  # exposure brackets below this are reported as singles
 
 
 @dataclass(slots=True, frozen=True)
@@ -597,6 +601,90 @@ def _dominant_signature(groups: list[Group]) -> Signature | None:
     return sig if count >= 2 and count >= 0.4 * total else None
 
 
+def _burst_linked(a: Shot, b: Shot, cfg: EngineConfig) -> bool:
+    ma, mb = a.meta, b.meta
+    if ma.lens and mb.lens and ma.lens != mb.lens:
+        return False
+    if not _rel_close(ma.focal_length, mb.focal_length, cfg.focal_tol):
+        return False
+    step = _frame_step(a, b)
+    if step is not None and not (0 <= step <= cfg.max_frame_skip):
+        return False
+    g = _gap(a, b)
+    if g is None:
+        return step == 1
+    limit = cfg.burst_max_gap + (0 if ma.time_precise and mb.time_precise else cfg.imprecise_slack)
+    return g <= limit
+
+
+def _burst_group(shots: list[Shot]) -> Group:
+    gaps = [g for a, b in zip(shots, shots[1:]) if (g := _gap(a, b)) is not None]
+    evidence = [f"{len(shots)} frames in quick succession"]
+    precise = all(s.meta.time_precise for s in shots)
+    if gaps and precise:
+        span = shots[-1].time - shots[0].time  # type: ignore[operator]
+        if span > 0:
+            evidence.append(f"{(len(shots) - 1) / span:.1f} fps")
+    evs = [s.ev for s in shots if s.ev is not None]
+    if len(evs) == len(shots):
+        evidence.append(f"exposure varies {max(evs) - min(evs):.2f} EV (metering, not a bracket)")
+    return Group("burst", shots, confidence=0.9 if precise else 0.7, evidence=evidence)
+
+
+def _form_bursts(groups: list[Group], cfg: EngineConfig) -> list[Group]:
+    """Merge chains of ungrouped frames shot at burst cadence into burst groups.
+
+    Runs after bracket detection, so bursts are whatever is fast but *not* a
+    bracket: frames the bracket scorer rejected (metering jitter, repeated
+    exposures) stay separate from real brackets.
+    """
+    out: list[Group] = []
+    buf: list[Shot] = []
+
+    def flush() -> None:
+        if len(buf) >= cfg.min_burst:
+            out.append(_burst_group(list(buf)))
+        else:
+            out.extend(Group("single", [s], confidence=1.0) for s in buf)
+        buf.clear()
+
+    for g in groups:
+        if g.kind == "single":
+            s = g.shots[0]
+            if buf and not _burst_linked(buf[-1], s, cfg):
+                flush()
+            buf.append(s)
+            continue
+        flush()
+        out.append(g)
+    flush()
+    return out
+
+
+def _pick_representative(g: Group) -> int:
+    """Index of the frame that stands for the group (what a culler should look at)."""
+    if g.kind == "exposure":
+        evs = [s.ev for s in g.shots]
+        if all(e is not None for e in evs):
+            ordered = sorted(evs)  # type: ignore[type-var]
+            mid = ordered[(len(ordered) - 1) // 2] if len(ordered) % 2 else (ordered[len(ordered) // 2 - 1] + ordered[len(ordered) // 2]) / 2
+            return min(range(g.size), key=lambda i: (abs(evs[i] - mid), abs(g.shots[i].meta.exposure_bias or 0.0), i))  # type: ignore[operator]
+    if g.kind in ("focus", "burst"):
+        return g.size // 2
+    return 0
+
+
+def _demote_low_confidence(groups: list[Group], cfg: EngineConfig) -> list[Group]:
+    out: list[Group] = []
+    for g in groups:
+        if g.kind == "exposure" and g.confidence < cfg.min_confidence:
+            for s in g.shots:
+                out.append(Group("single", [s], confidence=1.0, warnings=[f"weak bracket candidate ({g.confidence:.2f}) below threshold"]))
+        else:
+            out.append(g)
+    return out
+
+
 def _annotate(groups: list[Group], prior: Signature | None) -> None:
     for g in groups:
         if g.kind == "exposure" and prior is not None and g.size < prior.size and all(s.meta.exposure_mode == 2 for s in g.shots):
@@ -606,7 +694,7 @@ def _annotate(groups: list[Group], prior: Signature | None) -> None:
 
 
 def detect(shots: list[Shot], cfg: EngineConfig | None = None) -> list[Group]:
-    """Partition shots into exposure brackets, focus stacks and singles."""
+    """Partition shots into exposure brackets, focus stacks, bursts and singles."""
     cfg = cfg or EngineConfig()
     by_cam: dict[tuple[str, str, str], list[Shot]] = defaultdict(list)
     for s in shots:
@@ -621,7 +709,12 @@ def detect(shots: list[Shot], cfg: EngineConfig | None = None) -> list[Group]:
         prior = _dominant_signature(groups) if cfg.use_prior else None
         if prior is not None:
             groups = [g for run in runs for g in _segment_run(run, ctx, cfg, prior, cache)]
+        groups = _demote_low_confidence(groups, cfg)
         _annotate(groups, prior)
+        if cfg.detect_bursts:
+            groups = _form_bursts(groups, cfg)
         result.extend(groups)
     result.sort(key=lambda g: _order_key(g.shots[0]))
+    for g in result:
+        g.representative = _pick_representative(g)
     return result

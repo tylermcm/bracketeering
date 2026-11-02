@@ -79,12 +79,19 @@ def _order_for(profile: Profile, n: int, rng: random.Random) -> tuple[int, ...]:
 
 
 def generate(profile: Profile, n_events: int = 200, seed: int = 0) -> tuple[list[Shot], list[set[str]]]:
-    """Return (shots, truth) where truth is a list of sets of filenames forming real groups."""
+    """Return (shots, truth): truth lists the real brackets and focus stacks as sets of filenames."""
+    shots, truth, _ = generate_labeled(profile, n_events, seed)
+    return shots, truth
+
+
+def generate_labeled(profile: Profile, n_events: int = 200, seed: int = 0) -> tuple[list[Shot], list[set[str]], list[set[str]]]:
+    """Return (shots, brackets_and_stacks, bursts) with ground truth as sets of filenames."""
     rng = random.Random(seed)
     t = 1_700_000_000.0 + rng.random() * 1e6
     counter = rng.randint(1, 9000)
     shots: list[Shot] = []
     truth: list[set[str]] = []
+    bursts: list[set[str]] = []
     aperture, focal = rng.choice([4.0, 5.6, 8.0, 11.0]), rng.choice([16.0, 24.0, 35.0, 50.0])
     fixed = (rng.choice(profile.sizes), rng.choice(profile.steps))
     while (fixed[0] - 1) * fixed[1] > 12:
@@ -152,11 +159,13 @@ def generate(profile: Profile, n_events: int = 200, seed: int = 0) -> tuple[list
                 t += exp_t + rng.uniform(1.2, 4.0)
             truth.append(set(names))
         elif r < profile.p_bracket + profile.p_manual + profile.p_burst:
+            burst = set()
             for _ in range(rng.randint(4, 15)):  # AE burst with metering jitter
                 exp_t = nominal_shutter(base + rng.gauss(0, 0.35))
-                emit(exp_t, 100, 0, 0.0)
+                burst.add(emit(exp_t, 100, 0, 0.0))
                 t += exp_t + rng.uniform(0.05, 0.15)
                 base += rng.gauss(0, 0.15)
+            bursts.append(burst)
         elif r < profile.p_bracket + profile.p_manual + profile.p_burst + profile.p_focus:
             n = rng.randint(8, 30)
             exp_t = nominal_shutter(base)
@@ -171,7 +180,7 @@ def generate(profile: Profile, n_events: int = 200, seed: int = 0) -> tuple[list
             if rng.random() < 0.2:
                 t += rng.uniform(0.6, 2.5)
                 emit(nominal_shutter(base + rng.choice([-1, -2 / 3, 2 / 3, 1])), 100, 0, rng.choice([-1.0, 1.0]))
-    return shots, truth
+    return shots, truth, bursts
 
 
 @dataclass(slots=True)
@@ -197,7 +206,8 @@ class Metrics:
 
 
 def evaluate(groups: list[Group], truth: list[set[str]]) -> Metrics:
-    pred = [frozenset(s.name for s in g.shots) for g in groups if g.kind != "single"]
+    """Score bracket and focus-stack groups against ground truth (bursts are scored separately)."""
+    pred = [frozenset(s.name for s in g.shots) for g in groups if g.kind in ("exposure", "focus")]
     true = [frozenset(t) for t in truth]
     hits = len(set(pred) & set(true))
 
@@ -211,3 +221,32 @@ def evaluate(groups: list[Group], truth: list[set[str]]) -> Metrics:
     pp, tp = pairs(pred), pairs(true)
     inter = len(pp & tp)
     return Metrics(len(true), len(pred), hits, inter / len(pp) if pp else 1.0, inter / len(tp) if tp else 1.0)
+
+
+@dataclass(slots=True)
+class BurstMetrics:
+    truth_bursts: int
+    exact_hits: int
+    burst_frames: int
+    burst_frames_in_brackets: int  # burst frames wrongly grouped as a bracket / stack
+    bracket_frames: int
+    bracket_frames_in_bursts: int  # bracket frames wrongly grouped as a burst
+
+    @property
+    def recall(self) -> float:
+        return self.exact_hits / self.truth_bursts if self.truth_bursts else 1.0
+
+
+def evaluate_bursts(groups: list[Group], bursts: list[set[str]], brackets: list[set[str]]) -> BurstMetrics:
+    kind_of = {s.name: g.kind for g in groups for s in g.shots}
+    pred = {frozenset(s.name for s in g.shots) for g in groups if g.kind == "burst"}
+    burst_names = set().union(*bursts) if bursts else set()
+    bracket_names = set().union(*brackets) if brackets else set()
+    return BurstMetrics(
+        truth_bursts=len(bursts),
+        exact_hits=sum(frozenset(b) in pred for b in bursts),
+        burst_frames=len(burst_names),
+        burst_frames_in_brackets=sum(kind_of.get(n) in ("exposure", "focus") for n in burst_names),
+        bracket_frames=len(bracket_names),
+        bracket_frames_in_bursts=sum(kind_of.get(n) == "burst" for n in bracket_names),
+    )

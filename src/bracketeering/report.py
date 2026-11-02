@@ -1,4 +1,8 @@
-"""Serialise detection results to JSON / CSV / human-readable text."""
+"""Serialise detection results to JSON / CSV / human-readable text.
+
+JSON schema "bracketeering/2" (see SCHEMA.md) is the machine contract for
+pipelines: every input file appears exactly once in `files`, keyed by path.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +13,9 @@ from datetime import datetime, timezone
 
 from . import __version__
 from .model import FileMeta, Group, Shot
+
+SCHEMA = "bracketeering/2"
+_PREFIX = {"exposure": "B", "focus": "F", "burst": "U", "single": "S"}
 
 
 def _fmt_time(t: float | None) -> str | None:
@@ -23,10 +30,21 @@ def _fmt_shutter(t: float | None) -> str | None:
     return f"1/{round(1 / t)}" if t < 0.3 else f"{t:g}s"
 
 
-def _shot_dict(s: Shot) -> dict:
+def group_id(index: int, g: Group) -> str:
+    return f"{_PREFIX.get(g.kind, 'S')}{index:05d}"
+
+
+def frame_role(g: Group, pos: int) -> str:
+    if g.kind == "single":
+        return "single"
+    return "representative" if pos == g.representative else "member"
+
+
+def _frame_dict(g: Group, pos: int, s: Shot) -> dict:
     m = s.meta
-    return {
+    d = {
         "files": [str(p) for p in s.paths],
+        "role": frame_role(g, pos),
         "time": _fmt_time(m.capture_time),
         "shutter": _fmt_shutter(m.exposure_time),
         "aperture": m.f_number,
@@ -34,53 +52,70 @@ def _shot_dict(s: Shot) -> dict:
         "exposure_bias": m.exposure_bias,
         "ev": round(s.ev, 3) if s.ev is not None else None,
     }
-
-
-def group_id(index: int, g: Group) -> str:
-    prefix = {"exposure": "B", "focus": "F"}.get(g.kind, "S")
-    return f"{prefix}{index:05d}"
+    if g.best_exposed is not None:
+        d["best_exposed"] = pos == g.best_exposed
+    if s.pixels is not None:
+        d["exposure"] = s.pixels.to_dict()  # type: ignore[attr-defined]
+    return d
 
 
 def to_dict(groups: list[Group], errors: list[FileMeta] | None = None) -> dict:
-    brackets, stacks, singles = [], [], []
+    errs = {str(e.path): e.error for e in (errors or [])}
+    out_groups, files = [], {}
+    scene_sizes: dict[int, int] = {}
+    for g in groups:
+        if g.scene is not None:
+            scene_sizes[g.scene] = scene_sizes.get(g.scene, 0) + 1
     for i, g in enumerate(groups, 1):
-        if g.kind == "single":
-            entry = {"id": group_id(i, g), **_shot_dict(g.shots[0])}
-            if g.warnings:
-                entry["warnings"] = g.warnings
-            singles.append(entry)
-            continue
+        gid = group_id(i, g)
         m = g.shots[0].meta
         entry = {
-            "id": group_id(i, g),
+            "id": gid,
             "kind": g.kind,
             "size": g.size,
             "confidence": g.confidence,
             "camera": " ".join(x for x in (m.make, m.model) if x) or None,
             "start": _fmt_time(g.shots[0].time),
+            "representative": str(g.shots[g.representative].meta.path),
+            "best_exposed": str(g.shots[g.best_exposed].meta.path) if g.best_exposed is not None else None,
+            "scene": g.scene,
             "ev_offsets": g.ev_offsets if g.kind == "exposure" else None,
             "step_ev": g.step_ev if g.kind == "exposure" else None,
             "evidence": g.evidence,
             "warnings": g.warnings,
-            "frames": [_shot_dict(s) for s in g.shots],
+            "frames": [_frame_dict(g, pos, s) for pos, s in enumerate(g.shots)],
         }
-        (brackets if g.kind == "exposure" else stacks).append(entry)
-    n_shots = sum(g.size for g in groups)
+        out_groups.append(entry)
+        for pos, s in enumerate(g.shots):
+            for f in s.files:
+                key = str(f.path)
+                files[key] = {
+                    "group": gid,
+                    "kind": g.kind,
+                    "role": frame_role(g, pos),
+                    "position": pos + 1,
+                    "primary": f is s.meta,  # False for a sidecar (e.g. the JPEG of a RAW+JPEG pair)
+                    "scene": g.scene,
+                    "best_exposed": (pos == g.best_exposed) if g.best_exposed is not None else None,
+                    "error": errs.get(key),
+                }
+    count = {k: sum(g.kind == k for g in groups) for k in ("exposure", "focus", "burst", "single")}
     return {
-        "tool": "bracketeering",
-        "version": __version__,
+        "schema": SCHEMA,
+        "tool_version": __version__,
         "summary": {
-            "shots": n_shots,
-            "files": sum(len(s.files) for g in groups for s in g.shots),
-            "exposure_brackets": len(brackets),
-            "focus_stacks": len(stacks),
-            "singles": len(singles),
-            "unreadable": len(errors or []),
+            "shots": sum(g.size for g in groups),
+            "files": len(files),
+            "exposure_brackets": count["exposure"],
+            "focus_stacks": count["focus"],
+            "bursts": count["burst"],
+            "singles": count["single"],
+            "near_duplicate_scenes": sum(n > 1 for n in scene_sizes.values()),
+            "unreadable": len(errs),
         },
-        "brackets": brackets,
-        "focus_stacks": stacks,
-        "singles": singles,
-        "errors": [{"file": str(e.path), "error": e.error} for e in (errors or [])],
+        "groups": out_groups,
+        "files": files,
+        "errors": [{"file": k, "error": v} for k, v in errs.items()],
     }
 
 
@@ -91,15 +126,20 @@ def to_json(groups: list[Group], errors: list[FileMeta] | None = None) -> str:
 def to_csv(groups: list[Group]) -> str:
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["group_id", "kind", "size", "confidence", "position", "file", "time", "shutter", "aperture", "iso", "ev_offset"])
+    w.writerow(["file", "group_id", "kind", "role", "position", "group_size", "confidence", "scene", "best_exposed",
+                "time", "shutter", "aperture", "iso", "ev_offset", "exposure_flag", "highlights_clipped", "shadows_crushed"])
     for i, g in enumerate(groups, 1):
         offsets = g.ev_offsets if g.kind == "exposure" else []
-        for pos, s in enumerate(g.shots, 1):
+        for pos, s in enumerate(g.shots):
+            m, px = s.meta, s.pixels
             for p in s.paths:
-                m = s.meta
                 w.writerow([
-                    group_id(i, g), g.kind, g.size, g.confidence, pos, str(p), _fmt_time(m.capture_time),
-                    _fmt_shutter(m.exposure_time), m.f_number, m.iso, offsets[pos - 1] if offsets else "",
+                    str(p), group_id(i, g), g.kind, frame_role(g, pos), pos + 1, g.size, g.confidence,
+                    g.scene if g.scene is not None else "",
+                    "" if g.best_exposed is None else pos == g.best_exposed,
+                    _fmt_time(m.capture_time), _fmt_shutter(m.exposure_time), m.f_number, m.iso,
+                    offsets[pos] if offsets else "",
+                    px.flag if px else "", round(px.highlights, 4) if px else "", round(px.shadows, 4) if px else "",  # type: ignore[attr-defined]
                 ])
     return buf.getvalue()
 
@@ -107,18 +147,23 @@ def to_csv(groups: list[Group]) -> str:
 def to_text(groups: list[Group], errors: list[FileMeta] | None = None, verbose: bool = False) -> str:
     lines = []
     for i, g in enumerate(groups, 1):
+        scene = f"  scene {g.scene}" if g.scene is not None else ""
         if g.kind == "single":
             if verbose:
-                lines.append(f"{group_id(i, g)}  single   {g.shots[0].name}" + (f"  ! {'; '.join(g.warnings)}" if g.warnings else ""))
+                lines.append(f"{group_id(i, g)}  single   {g.shots[0].name}{scene}" + (f"  ! {'; '.join(g.warnings)}" if g.warnings else ""))
             continue
-        names = ", ".join(s.name for s in g.shots)
+        names = ", ".join(("*" if pos == g.representative else "") + s.name for pos, s in enumerate(g.shots))
         if g.kind == "exposure":
             offs = " ".join(f"{o:+g}" for o in g.ev_offsets)
             head = f"{group_id(i, g)}  bracket  {g.size} frames  step {g.step_ev} EV  [{offs}]  conf {g.confidence:.2f}"
+        elif g.kind == "burst":
+            head = f"{group_id(i, g)}  burst    {g.size} frames  conf {g.confidence:.2f}"
         else:
             head = f"{group_id(i, g)}  focus    {g.size} frames  conf {g.confidence:.2f}"
-        lines.append(head)
+        lines.append(head + scene)
         lines.append(f"         {names}")
+        if g.best_exposed is not None:
+            lines.append(f"         best exposed: {g.shots[g.best_exposed].name}")
         if verbose and g.evidence:
             lines.append(f"         evidence: {'; '.join(g.evidence)}")
         for w in g.warnings:
@@ -127,7 +172,9 @@ def to_text(groups: list[Group], errors: list[FileMeta] | None = None, verbose: 
     lines.append("")
     lines.append(
         f"{d['shots']} shots ({d['files']} files): {d['exposure_brackets']} exposure brackets, "
-        f"{d['focus_stacks']} focus stacks, {d['singles']} singles"
+        f"{d['bursts']} bursts, {d['focus_stacks']} focus stacks, {d['singles']} singles"
+        + (f", {d['near_duplicate_scenes']} near-duplicate scenes" if any(g.scene is not None for g in groups) else "")
         + (f", {d['unreadable']} unreadable" if d["unreadable"] else "")
+        + "   (* = representative frame)"
     )
     return "\n".join(lines)

@@ -12,6 +12,7 @@ from . import __version__, analyze
 from .engine import EngineConfig
 from .metadata import BACKENDS
 from .organize import MODES, execute, plan
+from .pixels import PixelConfig
 from .report import to_csv, to_json, to_text
 
 
@@ -31,23 +32,37 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--max-size", type=int, default=_DEFAULTS.max_size, help="largest bracket size (default %(default)s)")
     p.add_argument("--min-size", type=int, default=_DEFAULTS.min_size, help="smallest bracket size (default %(default)s)")
     p.add_argument("--no-focus", action="store_true", help="disable focus-stack detection")
+    p.add_argument("--no-bursts", action="store_true", help="disable burst grouping")
+    p.add_argument("--burst-gap", type=float, default=_DEFAULTS.burst_max_gap,
+                   help="max seconds between burst frames (default %(default)s)")
+    p.add_argument("--min-confidence", type=float, default=_DEFAULTS.min_confidence,
+                   help="report exposure brackets below this confidence as singles (default %(default)s)")
+    p.add_argument("--pixels", action="store_true",
+                   help="analyse embedded previews (needs Pillow): exposure stats, best-exposed frame, near-duplicate scenes")
+    p.add_argument("--scene-window", type=float, default=PixelConfig().scene_window,
+                   help="max seconds between groups of one near-duplicate scene (default %(default)s)")
+    p.add_argument("--hash-threshold", type=int, default=PixelConfig().hash_threshold,
+                   help="near-duplicate similarity: max differing hash bits of 64 (default %(default)s)")
 
 
 def _config(a: argparse.Namespace) -> EngineConfig:
     return EngineConfig(max_gap=a.max_gap, manual_max_gap=a.manual_gap, max_size=a.max_size,
-                        min_size=a.min_size, detect_focus=not a.no_focus)
+                        min_size=a.min_size, detect_focus=not a.no_focus, detect_bursts=not a.no_bursts,
+                        burst_max_gap=a.burst_gap, min_confidence=a.min_confidence)
 
 
 def _run(a: argparse.Namespace):
     t0 = time.perf_counter()
-    groups, errors = analyze(a.paths, _config(a), backend=a.backend, recursive=not a.no_recursive, workers=a.workers)
+    pcfg = PixelConfig(scene_window=a.scene_window, hash_threshold=a.hash_threshold)
+    groups, errors = analyze(a.paths, _config(a), backend=a.backend, recursive=not a.no_recursive,
+                             workers=a.workers, pixels=a.pixels, pixel_config=pcfg)
     n = sum(g.size for g in groups)
     print(f"analysed {n} shots in {time.perf_counter() - t0:.2f}s", file=sys.stderr)
     return groups, errors
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="bracketeer", description="Detect and group camera exposure brackets and focus stacks.")
+    ap = argparse.ArgumentParser(prog="bracketeer", description="Detect and group camera exposure brackets, bursts and focus stacks.")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -62,7 +77,6 @@ def main(argv: list[str] | None = None) -> int:
     op.add_argument("--dest", type=Path, required=True, help="destination root")
     op.add_argument("--mode", choices=MODES, default="copy")
     op.add_argument("--include-singles", action="store_true", help="also place singles in <dest>/_singles")
-    op.add_argument("--min-confidence", type=float, default=0.5)
     op.add_argument("--dry-run", action="store_true", help="print the plan without touching files")
 
     a = ap.parse_args(argv)
@@ -85,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
                 os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         return 0
 
-    actions = plan(groups, a.dest, include_singles=a.include_singles, min_confidence=a.min_confidence)
+    actions = plan(groups, a.dest, include_singles=a.include_singles)
     if a.dry_run:
         for act in actions:
             print(f"{a.mode}: {act.src} -> {act.dst}")

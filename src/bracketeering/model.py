@@ -101,6 +101,7 @@ class Shot:
     meta: FileMeta = field(init=False)
     ev: float | None = field(init=False)
     exposure_mask: tuple[bool, bool, bool] = field(init=False)
+    pixels: object | None = field(default=None, init=False)  # pixels.PixelStats when analysed
 
     def __post_init__(self) -> None:
         # The RAW is the most trustworthy source; otherwise the richest file.
@@ -131,12 +132,15 @@ class Shot:
 class Group:
     """A detected bracket (or a single, ungrouped shot when kind == "single")."""
 
-    kind: str  # "exposure", "focus", "single"
+    kind: str  # "exposure", "focus", "burst", "single"
     shots: list[Shot]
     score: float = 0.0
     confidence: float = 0.0
     evidence: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    representative: int = 0  # index into shots of the frame that stands for the group
+    best_exposed: int | None = None  # exposure brackets with pixel stats: exposed-to-the-right pick
+    scene: int | None = None  # near-duplicate set id (pixel analysis)
 
     @property
     def size(self) -> int:

@@ -57,6 +57,16 @@ class _Tiff:
             raise ValueError("truncated TIFF")
         return data
 
+    def next_ifd(self, off: int) -> int:
+        """Offset of the IFD chained after the one at `off` (0 when none)."""
+        if off <= 0:
+            return 0
+        (count,) = struct.unpack(self.e + "H", self._read(off, 2))
+        if count > _MAX_IFD_ENTRIES:
+            return 0
+        (nxt,) = struct.unpack(self.e + "I", self._read(off + 2 + count * 12, 4))
+        return nxt
+
     def ifd(self, off: int) -> dict[int, object]:
         if off <= 0:
             return {}

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bracketeering"
-version = "0.1.0"
+version = "0.2.0"
 description = "Fast, accurate detection and grouping of camera exposure brackets and focus stacks"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,6 +12,7 @@ license = { text = "MIT" }
 dependencies = []
 
 [project.optional-dependencies]
+pixels = ["pillow>=10"]
 dev = ["pytest>=7", "pillow>=10"]
 
 [project.scripts]

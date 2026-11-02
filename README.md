@@ -1,29 +1,35 @@
 # bracketeering
 
-Fast, accurate detection and grouping of camera **exposure brackets** (AEB / HDR sets) and **focus stacks** from a folder of photos.
+Fast, accurate detection and grouping of camera **exposure brackets** (AEB / HDR sets), **bursts** and **focus stacks** from a folder of photos. Optionally, it also finds **near-duplicate scenes** and per-frame **exposure problems**.
+
+It's built as the grouping step of a photo-culling pipeline. Every file gets a group, a kind and a role, so the next stage knows which frames are alternatives of one another and which single frame stands for each group. The JSON contract is documented in [SCHEMA.md](SCHEMA.md).
 
 Example output:
 
 ```
 $ bracketeer scan /Volumes/CARD
 B00001  bracket  5 frames  step 1 EV  [+0 -1 +1 -2 +2]  conf 0.99
-         IMG_0412.CR3, IMG_0413.CR3, IMG_0414.CR3, IMG_0415.CR3, IMG_0416.CR3
+         *IMG_0412.CR3, IMG_0413.CR3, IMG_0414.CR3, IMG_0415.CR3, IMG_0416.CR3
 B00007  bracket  3 frames  step 2 EV  [+0 -2 +2]  conf 0.98
-         IMG_0430.CR3, IMG_0431.CR3, IMG_0432.CR3
+         *IMG_0430.CR3, IMG_0431.CR3, IMG_0432.CR3
+U00008  burst    9 frames  conf 0.90
+         IMG_0433.CR3, ..., *IMG_0437.CR3, ...
 F00009  focus    24 frames  conf 0.95
          IMG_0440.CR3, ...
 
-1873 shots (3746 files): 214 exposure brackets, 3 focus stacks, 611 singles
+1873 shots (3746 files): 214 exposure brackets, 41 bursts, 3 focus stacks, 611 singles   (* = representative frame)
 ```
 
 - **No required dependencies.** Pure Python 3.10+. A built-in EXIF reader handles JPEG, TIFF, DNG, CR2, CR3, NEF, NRW, ARW, SR2, ORF, RW2, PEF, RAF and other TIFF-based RAWs. If [exiftool](https://exiftool.org) is installed, it covers everything else and adds maker-note bracket tags.
 - **Efficient.** The reader seeks straight to the IFD entries it needs and reads a few KB per file, even from a 60 MB RAW. Files are read in parallel. In one test, 3,000 RAW-sized files took about 1 s end to end. Grouping runs at 10–20k shots/s.
+- **Pixel analysis is optional.** `--pixels` (needs Pillow) decodes each RAW's embedded JPEG preview, not the RAW itself, at about 5 ms per file.
 - **Explainable.** Every group lists its evidence, a confidence score, and warnings such as missing frames or partial brackets.
 
 ## Install
 
 ```bash
 pip install -e .            # provides the `bracketeer` command
+pip install -e '.[pixels]'  # + Pillow, for --pixels
 pip install -e '.[dev]'     # + pytest, pillow for the test-suite
 ```
 
@@ -33,25 +39,39 @@ pip install -e '.[dev]'     # + pytest, pillow for the test-suite
 bracketeer scan PATH...                       # human-readable report
 bracketeer scan PATH... -v                    # include singles and evidence
 bracketeer scan PATH... --format json -o report.json
-bracketeer scan PATH... --format csv
+bracketeer scan PATH... --format csv          # one row per file
+bracketeer scan PATH... --pixels --format json # + exposure stats, best-exposed frame, near-duplicate scenes
 
 bracketeer organize PATH... --dest ./sorted --dry-run
 bracketeer organize PATH... --dest ./sorted --mode copy|move|symlink|hardlink
 ```
 
-Useful options: `--backend auto|native|exiftool`, `--max-gap` (seconds allowed between frames, default 2), `--manual-gap` (for hand-adjusted brackets in M mode, default 6), `--max-size`, `--min-size`, `--no-focus`.
+Useful options:
+- `--backend auto|native|exiftool`
+- `--max-gap`: seconds allowed between bracket frames (default 2)
+- `--manual-gap`: for hand-adjusted brackets in M mode (default 6)
+- `--burst-gap`: seconds between burst frames (default 1)
+- `--min-confidence`: weaker bracket candidates become singles (default 0.5)
+- `--scene-window`, `--hash-threshold`: near-duplicate tuning
+- `--max-size`, `--min-size`, `--no-focus`, `--no-bursts`
 
-`organize` creates one folder per group, for example `20240501-120000_IMG_0412_HDR5x1EV/`. It keeps RAW+JPEG sidecars together and never overwrites existing files.
+`organize` creates one folder per group, for example `20240501-120000_IMG_0412_HDR5x1EV/` or `…_BURST9/`. It keeps RAW+JPEG sidecars together and never overwrites existing files.
 
 ### Python API
 
 ```python
 from bracketeering import analyze, EngineConfig
 
-groups, unreadable = analyze(["/photos/2024-05-01"], EngineConfig(max_gap=3))
+groups, unreadable = analyze(["/photos/2024-05-01"], EngineConfig(min_confidence=0.8), pixels=True)
 for g in groups:
+    rep = g.shots[g.representative]          # the frame that stands for the group
     if g.kind == "exposure":
-        print(g.size, g.step_ev, g.ev_offsets, g.confidence, [str(p) for s in g.shots for p in s.paths])
+        best = g.shots[g.best_exposed] if g.best_exposed is not None else rep
+        print("bracket", g.size, g.ev_offsets, "best exposed:", best.meta.path, "scene", g.scene)
+    elif g.kind == "burst":
+        print("burst", [s.meta.path for s in g.shots])
+
+from bracketeering.report import to_dict    # the SCHEMA.md structure, ready for json.dumps
 ```
 
 `bracketeering.detect(shots)` runs only the grouping engine. Use it if you already have metadata from your own source, such as a catalog database.
@@ -69,21 +89,29 @@ for g in groups:
    - **Context.** Groups that change two exposure variables at once, change white balance or fire a flash are penalised. A large time gap favours a boundary there.
    - **Burst veto.** Auto-exposure bursts wander in 1/3-stop increments and can look like small brackets. A group without metadata support is dissolved if ungrouped frames, or groups with a different signature, sit next to it at the same cadence and exposure level.
 6. **Second pass with a prior.** Photographers rarely change bracket settings mid-shoot. The camera's dominant signature (size, firing order, step) becomes a prior, and the DP runs again. This settles the hard cases, such as back-to-back brackets fired in continuous drive with no pause. Group evaluations are cached, so the second pass costs almost nothing.
+7. **Bursts.** After brackets are settled, chains of leftover frames shot at burst cadence (≤ `burst_max_gap` apart, same lens and focal length) become burst groups. Because bracket detection runs first, a burst is "fast, but not a bracket". That's how metering-jitter bursts and repeated exposures are kept apart from real brackets.
+8. **Representatives.** Each group gets a representative frame. For brackets it's the middle exposure (≈ 0 EV); for bursts and stacks it's the middle frame.
+9. **Pixels (optional).** Embedded previews are found in each container (JPEG `APP1`, TIFF/NEF/ARW/DNG/CR2 preview IFDs and SubIFDs, RW2 `JpgFromRaw`, RAF, CR3 `PRVW`). Lossless-JPEG raw data is skipped. Each preview is decoded at reduced size, and the engine computes:
+   - **Exposure stats** per frame: highlight clipping (any channel ≥ 250), crushed shadows, mean level, and an `ok`/`over`/`under` flag.
+   - **`best_exposed`** per bracket: the brightest frame whose highlights hold (≤ 0.5% clipped), i.e. expose to the right. Of the usable frames it has the cleanest shadows.
+   - **Near-duplicate scenes:** consecutive groups from one body, at most `scene_window` apart, whose representatives have a similar perceptual hash (dHash). Gradient-based hashing tolerates exposure differences.
 
 ## Accuracy
 
-`scripts/benchmark.py` simulates realistic shoots with known ground truth. The simulator includes AEB in several firing orders and both drive modes, back-to-back brackets, deleted frames, hand-adjusted manual brackets, auto-exposure bursts with metering jitter, focus stacks, single shots, and quick handheld pairs with an exposure tweak. Shutter speeds are quantised to real nominal values. Results over 20 seeds (~4,000 groups per profile):
+`scripts/benchmark.py` simulates realistic shoots with known ground truth. The simulator includes AEB in several firing orders and both drive modes, back-to-back brackets, deleted frames, hand-adjusted manual brackets, auto-exposure bursts with metering jitter, focus stacks, single shots, and quick handheld pairs with an exposure tweak. Shutter speeds are quantised to real nominal values. Results over 20 seeds (~4,000 brackets and ~900 bursts per profile):
 
-| profile | what's hard about it | exact-group precision | exact-group recall | pairwise F1 |
-|---|---|---|---|---|
-| canon-aeb | baseline: full metadata | 0.999 | 0.999 | 1.000 |
-| sony-no-subsec | timestamps only to the second | 0.999 | 0.999 | 0.999 |
-| nikon-mixed-settings | size 2–9 and step ⅓–3 EV change every bracket | 0.990 | 0.978 | 0.999 |
-| manual-brackets | user-driven brackets, 1–4 s apart, no bracket flags | 0.988 | 0.970 | 0.995 |
-| no-bracket-metadata | no ExposureMode, no exposure compensation, AE bursts | 0.979 | 0.968 | 0.997 |
-| worst-case | all of the above, no sub-seconds, 50% back-to-back | 0.977 | 0.959 | 0.993 |
+| profile | what's hard about it | bracket precision | bracket recall | burst recall | burst→bracket | bracket→burst |
+|---|---|---|---|---|---|---|
+| canon-aeb | baseline: full metadata | 0.999 | 0.999 | 1.000 | 0.00% | 0.01% |
+| sony-no-subsec | timestamps only to the second | 0.999 | 0.999 | 0.952 | 0.00% | 0.02% |
+| nikon-mixed-settings | size 2–9 and step ⅓–3 EV change every bracket | 0.990 | 0.978 | 1.000 | 0.00% | 0.18% |
+| manual-brackets | user-driven brackets, 1–4 s apart, no bracket flags | 0.988 | 0.970 | 0.998 | 0.09% | 0.48% |
+| no-bracket-metadata | no ExposureMode, no exposure compensation, AE bursts | 0.979 | 0.968 | 0.997 | 0.13% | 0.76% |
+| worst-case | all of the above, no sub-seconds, 50% back-to-back | 0.977 | 0.959 | 0.946 | 0.40% | 1.87% |
 
-"Exact" means the predicted group contains exactly the right frames. Most remaining errors are inherently ambiguous without metadata, for example a 1/3-EV bracket next to an auto-exposure burst. Use `--backend exiftool` when maker notes are available.
+Precision and recall are for exact groups: the predicted group contains exactly the right frames. The last two columns measure confusion between the two kinds: the share of burst frames wrongly placed in a bracket, and of bracket frames wrongly placed in a burst. Without sub-second timestamps, a burst sometimes absorbs a neighbouring single. That's why burst recall is lower in those profiles.
+
+These numbers come from a simulator written alongside the engine, so they reflect its assumptions about camera behaviour. Real shoots are the true test. Most remaining errors are inherently ambiguous without metadata, for example a 1/3-EV bracket next to an auto-exposure burst. Use `--backend exiftool` when maker notes are available.
 
 ```bash
 python scripts/benchmark.py --seeds 20
@@ -97,8 +125,10 @@ src/bracketeering/
   metadata/native.py    dependency-free EXIF reader (JPEG/TIFF/RAW/RAF/CR3)
   metadata/exiftool.py  batched exiftool backend + maker-note normalisation
   scan.py               file discovery, RAW+JPEG pairing
-  engine.py             run splitting, scoring, DP segmentation, priors
-  report.py             text / JSON / CSV output
+  engine.py             run splitting, scoring, DP segmentation, priors, bursts
+  preview.py            embedded JPEG preview extraction
+  pixels.py             exposure stats, best-exposed pick, near-duplicate scenes
+  report.py             text / JSON (SCHEMA.md) / CSV output
   organize.py           copy / move / link groups into folders
   synth.py              shoot simulator + evaluation metrics
   cli.py                `bracketeer` command
@@ -110,3 +140,6 @@ src/bracketeering/
 - The native reader doesn't decode maker notes. Bracket detection still works from EXIF and exposure analysis, but maker-note shot positions need `--backend exiftool`.
 - HEIC/HEIF and less common RAW containers fall back to exiftool when it's installed. Without exiftool, they're reported as unreadable.
 - White-balance, flash and ISO-only brackets are not grouped as exposure brackets.
+- Pixel exposure stats come from the camera's JPEG preview, which clips highlights earlier than the RAW does, so `over` is conservative. Treat the stats as a triage signal, not a RAW-accurate measurement.
+- Near-duplicate detection only links *consecutive* groups from the same body within `scene_window`. Returning to a subject after shooting something else starts a new scene.
+- HEIC files have no extractable preview without extra libraries, so `--pixels` skips them.

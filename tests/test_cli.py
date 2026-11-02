@@ -24,11 +24,20 @@ def test_scan_json(tmp_path, capsys):
     _shoot(src)
     assert main(["scan", str(src), "--format", "json", "--backend", "native"]) == 0
     data = json.loads(capsys.readouterr().out)
+    assert data["schema"] == "bracketeering/2"
     assert data["summary"]["exposure_brackets"] == 1
     assert data["summary"]["singles"] == 1
-    b = data["brackets"][0]
+    b = next(g for g in data["groups"] if g["kind"] == "exposure")
     assert [f["files"][0].rsplit("/", 1)[1] for f in b["frames"]] == ["IMG_0001.JPG", "IMG_0002.JPG", "IMG_0003.JPG"]
     assert b["ev_offsets"] == [0.0, -1.0, 1.0]
+    assert b["representative"].endswith("IMG_0001.JPG")
+    # every input file appears exactly once in the per-file index
+    files = {k.rsplit("/", 1)[1]: v for k, v in data["files"].items()}
+    assert sorted(files) == ["IMG_0001.JPG", "IMG_0002.JPG", "IMG_0003.JPG", "IMG_0004.JPG"]
+    assert files["IMG_0001.JPG"]["role"] == "representative"
+    assert files["IMG_0002.JPG"]["role"] == "member"
+    assert files["IMG_0002.JPG"]["group"] == b["id"]
+    assert files["IMG_0004.JPG"]["role"] == "single"
 
 
 def test_organize_copy_and_dry_run(tmp_path, capsys):

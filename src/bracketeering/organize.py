@@ -28,6 +28,8 @@ def folder_name(g: Group, index: int) -> str:
     stem = first.meta.path.stem
     if g.kind == "exposure":
         return f"{stamp}_{stem}_HDR{g.size}x{g.step_ev:g}EV"
+    if g.kind == "burst":
+        return f"{stamp}_{stem}_BURST{g.size}"
     return f"{stamp}_{stem}_STACK{g.size}"
 
 

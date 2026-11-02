@@ -51,22 +51,67 @@ def test_long_exposure_gap_accounts_for_shutter_time():
     assert names(detect(r.shots), "exposure") == [b]
 
 
-def test_singles_and_burst_are_not_grouped():
+def test_ae_burst_is_a_burst_not_a_bracket():
     r = Roll()
-    for s in (1 / 200, 1 / 250, 1 / 200, 1 / 160, 1 / 200):  # AE burst with metering jitter
-        r.shot(s, gap=0.1, mode=0)
+    burst = [r.shot(s, gap=0.1, mode=0) for s in (1 / 200, 1 / 250, 1 / 200, 1 / 160, 1 / 200)]  # metering jitter
     r.pause(10)
-    r.shot(1 / 100, mode=0)
+    single = r.shot(1 / 100, mode=0)
     g = detect(r.shots)
     assert names(g, "exposure") == []
-    assert all(x.kind == "single" for x in g)
+    assert names(g, "burst") == [burst]
+    assert names(g, "single") == [[single]]
+
+
+def test_bracket_then_burst_are_separated():
+    r = Roll()
+    b = r.bracket(1 / 250, [0, -1, 1], gap=0.1)
+    burst = [r.shot(1 / 250, gap=0.1, mode=0) for _ in range(6)]
+    g = detect(r.shots)
+    assert names(g, "exposure") == [b]
+    assert names(g, "burst") == [burst]
+
+
+def test_slow_singles_are_not_a_burst():
+    r = Roll()
+    for _ in range(4):
+        r.shot(1 / 250, gap=3.0, mode=0)
+    assert all(x.kind == "single" for x in detect(r.shots))
+
+
+def test_bursts_can_be_disabled():
+    r = Roll()
+    for _ in range(5):
+        r.shot(1 / 500, gap=0.05, mode=0)
+    assert all(x.kind == "single" for x in detect(r.shots, EngineConfig(detect_bursts=False)))
+
+
+def test_representative_is_the_middle_exposure():
+    r = Roll()
+    b = r.bracket(1 / 125, [-2, -1, 0, 1, 2])
+    g = detect(r.shots)[0]
+    assert g.shots[g.representative].name == b[2]
+    r = Roll()
+    b = r.bracket(1 / 125, [0, -1, 1])
+    g = detect(r.shots)[0]
+    assert g.shots[g.representative].name == b[0]
+
+
+def test_min_confidence_demotes_weak_brackets():
+    r = Roll()
+    r.bracket(1 / 125, [-1, 0, 1], mode=0)  # no metadata: decent but not certain
+    weak = detect(r.shots)[0]
+    assert weak.kind == "exposure"
+    demoted = detect(r.shots, EngineConfig(min_confidence=min(0.999, weak.confidence + 0.01), detect_bursts=False))
+    assert all(x.kind == "single" for x in demoted)
 
 
 def test_same_exposure_burst_is_not_a_bracket():
     r = Roll()
     for _ in range(6):
         r.shot(1 / 500, gap=0.05, mode=0)
-    assert names(detect(r.shots), "exposure") == []
+    g = detect(r.shots)
+    assert names(g, "exposure") == []
+    assert [x.kind for x in g] == ["burst"]
 
 
 def test_deleted_middle_frame_still_grouped_with_warning():
@@ -178,3 +223,15 @@ def test_synthetic_accuracy(profile, min_f1):
         hits, truth, pred = hits + m.exact_hits, truth + m.truth_groups, pred + m.predicted_groups
     p, r = hits / pred, hits / truth
     assert 2 * p * r / (p + r) >= min_f1
+
+
+@pytest.mark.parametrize("profile", ["canon-aeb", "no-bracket-metadata", "worst-case"])
+def test_bursts_and_brackets_stay_apart(profile):
+    from bracketeering.synth import evaluate_bursts, generate_labeled
+    bf = bfb = kf = kfb = 0
+    for seed in range(3):
+        shots, brackets, bursts = generate_labeled(PROFILES[profile], 200, seed + 2000)
+        b = evaluate_bursts(detect(shots), bursts, brackets)
+        bf, bfb, kf, kfb = bf + b.burst_frames, bfb + b.burst_frames_in_brackets, kf + b.bracket_frames, kfb + b.bracket_frames_in_bursts
+    assert bfb / bf < 0.02
+    assert kfb / kf < 0.03
