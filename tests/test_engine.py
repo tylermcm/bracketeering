@@ -1,3 +1,5 @@
+import math
+
 import pytest
 
 from bracketeering.engine import EngineConfig, detect, known_orders
@@ -15,11 +17,40 @@ def test_single_bracket_centre_first():
     assert g[0].confidence > 0.95
 
 
-@pytest.mark.parametrize("offsets", [[0, -1, 1, -2, 2], [-2, -1, 0, 1, 2], [0, -2, 2], [-3, -1.5, 0, 1.5, 3, 4.5, -4.5]])
+@pytest.mark.parametrize("offsets", [[0, -1, 1, -2, 2], [-2, -1, 0, 1, 2], [0, -2, 2], [-3, -1.5, 0, 1.5, 3, 4.5, -4.5],
+                                     [0, -1 / 3, 1 / 3], [0, -2 / 3, 2 / 3, -4 / 3, 4 / 3]])
 def test_bracket_shapes(offsets):
     r = Roll()
     b = r.bracket(1 / 60, offsets)
     assert names(detect(r.shots), "exposure") == [b]
+
+
+@pytest.mark.parametrize("base_f", [2.8, 5.6, 8.0, 11, 13])
+@pytest.mark.parametrize("offsets", [[0, -1 / 3, 1 / 3], [0, -2 / 3, 2 / 3, -4 / 3, 4 / 3], [0, -1, 1]])
+def test_shutter_priority_aperture_bracket(base_f, offsets):
+    """Tv/S-mode AEB varies the aperture; nominal f-labels (f/13 = f/12.7) must not break it."""
+    r = Roll()
+    b = r.aperture_bracket(1 / 500, base_f, offsets)
+    g = detect(r.shots)
+    assert names(g, "exposure") == [b]
+    expected = [round(o, 2) for o in offsets]
+    assert g[0].ev_offsets == pytest.approx(expected, abs=0.02)
+
+
+def test_iso_bracket_in_manual_with_auto_iso():
+    r = Roll()
+    b = [r.shot(1 / 250, iso=iso, bias=float(o)) for iso, o in ((400, 0), (200, -1), (800, 1))]
+    assert names(detect(r.shots), "exposure") == [b]
+
+
+def test_nominal_labels_snap_to_exact_stops():
+    from bracketeering.model import log2_aperture_stops, log2_iso, log2_shutter
+    assert log2_aperture_stops(13) == pytest.approx(22 / 3)  # f/13 is really f/12.7
+    assert log2_aperture_stops(11) - log2_aperture_stops(13) == pytest.approx(-1 / 3)
+    assert log2_shutter(1 / 125) == pytest.approx(-7)
+    assert log2_shutter(1 / 13) == pytest.approx(-11 / 3)
+    assert log2_iso(640) == pytest.approx(8 / 3)
+    assert log2_aperture_stops(4.8) == pytest.approx(2 * math.log2(4.8))  # half-stop label: kept as recorded
 
 
 def test_back_to_back_brackets_no_pause():

@@ -83,7 +83,7 @@ from bracketeering.report import to_dict    # the SCHEMA.md structure, ready for
 3. **Split into runs** per camera body. A run is a chain of consecutive frames with the same lens and focal length and comparable exposure data. Each frame must start within `max_gap` of the *end* of the previous exposure, so long-exposure brackets work. Large frame-counter jumps also end a run.
 4. **Carve out focus stacks.** These are constant-exposure blocks flagged by maker notes, or with monotonic focus distance.
 5. **Segment each run by dynamic programming.** Each candidate group gets an additive log-odds-style score, and singles score zero. The engine finds the partition with the highest total score:
-   - **Exposure structure.** Exposures must be distinct and evenly spaced. The step is fitted on the 1/3- and 1/2-stop grid and tolerates nominal shutter-speed rounding. An interior gap of exactly *k* steps means *k*−1 frames were deleted. The group is still accepted, with a warning.
+   - **Exposure structure.** Brightness is measured from all three settings: log2(shutter) + log2(ISO/100) − 2·log2(f-number). That makes shutter-driven brackets (A/Av and M modes), aperture-driven brackets (S/Tv mode) and auto-ISO brackets all register. Cameras write rounded labels (f/13 is really f/12.7, 1/125 s is really 1/128 s), so standard ⅓-stop labels are snapped back to their exact values first. Exposures must be distinct and evenly spaced. The step is fitted on the 1/3- and 1/2-stop grid and tolerates nominal shutter-speed rounding. An interior gap of exactly *k* steps means *k*−1 frames were deleted. The group is still accepted, with a warning.
    - **Firing order.** Groups that match the orders cameras actually use score higher: `0,-,+`, `-,0,+`, `+,0,-`, `0,+,-`, `0,-,--,+,++`, … The engine also matches partial brackets with a missing frame at either end.
    - **Metadata.** Evidence includes `ExposureMode = auto bracket`, maker-note bracket mode, shot positions `1..n` (a reset to 1 inside a group is a hard veto), and exposure compensation matching the measured deltas. A frame flagged as bracketed is penalised if it's left ungrouped. If a body is seen writing `ExposureMode=2` elsewhere in the shoot, its frames with other modes count *against* bracketing.
    - **Context.** Groups that change two exposure variables at once, change white balance or fire a flash are penalised. A large time gap favours a boundary there.
@@ -104,10 +104,10 @@ from bracketeering.report import to_dict    # the SCHEMA.md structure, ready for
 |---|---|---|---|---|---|---|
 | canon-aeb | baseline: full metadata | 0.999 | 0.999 | 1.000 | 0.00% | 0.01% |
 | sony-no-subsec | timestamps only to the second | 0.999 | 0.999 | 0.952 | 0.00% | 0.02% |
-| nikon-mixed-settings | size 2–9 and step ⅓–3 EV change every bracket | 0.990 | 0.978 | 1.000 | 0.00% | 0.18% |
-| manual-brackets | user-driven brackets, 1–4 s apart, no bracket flags | 0.988 | 0.970 | 0.998 | 0.09% | 0.48% |
-| no-bracket-metadata | no ExposureMode, no exposure compensation, AE bursts | 0.979 | 0.968 | 0.997 | 0.13% | 0.76% |
-| worst-case | all of the above, no sub-seconds, 50% back-to-back | 0.977 | 0.959 | 0.946 | 0.40% | 1.87% |
+| nikon-mixed-settings | size 2–9 and step ⅓–3 EV change every bracket | 0.991 | 0.982 | 1.000 | 0.00% | 0.10% |
+| manual-brackets | user-driven brackets, 1–4 s apart, no bracket flags | 0.996 | 0.979 | 0.994 | 0.27% | 0.35% |
+| no-bracket-metadata | no ExposureMode, no exposure compensation, AE bursts | 0.979 | 0.968 | 0.997 | 0.15% | 0.76% |
+| worst-case | all of the above, no sub-seconds, 50% back-to-back | 0.980 | 0.964 | 0.941 | 0.71% | 1.52% |
 
 Precision and recall are for exact groups: the predicted group contains exactly the right frames. The last two columns measure confusion between the two kinds: the share of burst frames wrongly placed in a bracket, and of bracket frames wrongly placed in a burst. Without sub-second timestamps, a burst sometimes absorbs a neighbouring single. That's why burst recall is lower in those profiles.
 
@@ -139,7 +139,9 @@ src/bracketeering/
 - Times in reports are UTC when the file records an offset (`OffsetTimeOriginal`), and camera-local otherwise.
 - The native reader doesn't decode maker notes. Bracket detection still works from EXIF and exposure analysis, but maker-note shot positions need `--backend exiftool`.
 - HEIC/HEIF and less common RAW containers fall back to exiftool when it's installed. Without exiftool, they're reported as unreadable.
-- White-balance, flash and ISO-only brackets are not grouped as exposure brackets.
+- White-balance and flash brackets are not grouped as exposure brackets. ISO brackets (auto-ISO AEB) are.
+- ⅓-stop brackets need metadata support (EXIF auto-bracket flag, maker notes or matching exposure compensation). Without it, a ⅓-stop series looks the same as metering drift in a burst, so it isn't grouped.
+- Depth-of-field series (several apertures at the *same* exposure, with the shutter compensating) aren't exposure brackets. They come out as a burst or singles.
 - Pixel exposure stats come from the camera's JPEG preview, which clips highlights earlier than the RAW does, so `over` is conservative. Treat the stats as a triage signal, not a RAW-accurate measurement.
 - Near-duplicate detection only links *consecutive* groups from the same body within `scene_window`. Returning to a subject after shooting something else starts a new scene.
 - HEIC files have no extractable preview without extra libraries, so `--pixels` skips them.

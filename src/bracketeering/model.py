@@ -76,20 +76,64 @@ class FileMeta:
         )
 
 
+# Cameras write *nominal* 1/3-stop values: rounded labels for exact powers of
+# two. f/13 is really f/12.7 and 1/125 s is really 1/128 s. Between f/9 and
+# f/16 the labels are off by up to 0.15 EV, enough to make a 1/3-stop
+# aperture bracket look irregular. These tables map each label back to its
+# exact stop (in thirds). Values not in a table (half-stop labels like f/4.8
+# or 1/90, or exact values some bodies write) are used as recorded.
+_NOMINAL_F = (
+    1.0, 1.1, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.5, 2.8, 3.2, 3.5, 4.0, 4.5, 5.0, 5.6, 6.3, 7.1, 8.0, 9.0,
+    10, 11, 13, 14, 16, 18, 20, 22, 25, 29, 32, 36, 40, 45, 51, 57, 64,
+)
+_NOMINAL_T_FAST = (  # denominators of 1/x s, from 1/8000 s down to 1/4 s
+    8000, 6400, 5000, 4000, 3200, 2500, 2000, 1600, 1250, 1000, 800, 640, 500, 400, 320, 250, 200, 160,
+    125, 100, 80, 60, 50, 40, 30, 25, 20, 15, 13, 10, 8, 6, 5, 4,
+)
+_NOMINAL_T_SLOW = (0.3, 0.4, 0.5, 0.6, 0.8, 1, 1.3, 1.6, 2, 2.5, 3.2, 4, 5, 6, 8, 10, 13, 15, 20, 25, 30)
+_NOMINAL_ISO = (
+    50, 64, 80, 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000,
+    5000, 6400, 8000, 10000, 12800, 16000, 20000, 25600, 32000, 40000, 51200, 64000, 80000, 102400,
+)
+
+
+def _thirds(x: float) -> float:
+    return round(x * 3) / 3
+
+
+def log2_shutter(t: float) -> float:
+    lt = math.log2(t)
+    if t < 0.3:
+        return _thirds(lt) if any(abs(1 / t - d) <= 0.005 * d for d in _NOMINAL_T_FAST) else lt
+    return _thirds(lt) if any(abs(t - n) <= 0.005 * n for n in _NOMINAL_T_SLOW) else lt
+
+
+def log2_aperture_stops(n: float) -> float:
+    """Stops of light lost to the aperture, 2*log2(N), snapped for nominal f-numbers."""
+    stops = 2.0 * math.log2(n)
+    return _thirds(stops) if any(abs(n - f) <= 0.005 * f for f in _NOMINAL_F) else stops
+
+
+def log2_iso(iso: float) -> float:
+    li = math.log2(iso / 100.0)
+    return _thirds(li) if any(abs(iso - i) <= 0.005 * i for i in _NOMINAL_ISO) else li
+
+
 def _relative_ev(m: FileMeta) -> float | None:
     """Relative image brightness in stops (higher = brighter).
 
-    log2(t) + log2(ISO/100) - 2*log2(N). Unlike "EV" this captures every leg
-    of the exposure triangle, so shutter, aperture and ISO brackets all
-    register. Only comparable between shots with the same exposure_mask.
+    log2(t) + log2(ISO/100) - 2*log2(N), with nominal labels snapped to exact
+    1/3 stops. Unlike "EV" this captures every leg of the exposure triangle,
+    so shutter, aperture (shutter-priority AEB) and ISO brackets all register.
+    Only comparable between shots with the same exposure_mask.
     """
     if m.exposure_time is None or m.exposure_time <= 0:
         return None
-    v = math.log2(m.exposure_time)
+    v = log2_shutter(m.exposure_time)
     if m.iso is not None and m.iso > 0:
-        v += math.log2(m.iso / 100.0)
+        v += log2_iso(m.iso)
     if m.f_number is not None and m.f_number > 0:
-        v -= 2.0 * math.log2(m.f_number)
+        v -= log2_aperture_stops(m.f_number)
     return v
 
 
