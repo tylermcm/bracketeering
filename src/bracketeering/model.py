@@ -54,6 +54,8 @@ class FileMeta:
     # Maker-note derived hints (exiftool backend only).
     bracket_kind: str | None = None  # "exposure", "focus", "flash", "wb", "iso", "none"
     bracket_position: int | None = None  # 1-based position within a bracket
+    drive_mode: str | None = None  # "continuous" or "single" (maker notes)
+    sequence_number: int | None = None  # frame index within a continuous-drive burst (maker notes)
     file_number: int | None = None
     reader: str | None = None
     error: str | None = None
@@ -170,6 +172,17 @@ class Shot:
     @property
     def time(self) -> float | None:
         return self.meta.capture_time
+
+
+def frame_step(a: Shot, b: Shot) -> int | None:
+    """Frame-counter difference b - a, handling the 9999 -> 0001 wrap."""
+    fa, fb = a.meta.file_number, b.meta.file_number
+    if fa is None or fb is None:
+        return None
+    d = fb - fa
+    if d < 0 and fa > 9000 and fb < 1000:
+        d += 10000 if fa < 10000 else 100000
+    return d
 
 
 @dataclass(slots=True)

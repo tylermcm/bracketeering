@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from . import __version__, analyze
+from .bursts import BurstConfig
 from .engine import EngineConfig
 from .metadata import BACKENDS
 from .organize import MODES, execute, plan
@@ -33,8 +34,9 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--min-size", type=int, default=_DEFAULTS.min_size, help="smallest bracket size (default %(default)s)")
     p.add_argument("--no-focus", action="store_true", help="disable focus-stack detection")
     p.add_argument("--no-bursts", action="store_true", help="disable burst grouping")
-    p.add_argument("--burst-gap", type=float, default=_DEFAULTS.burst_max_gap,
-                   help="max seconds between burst frames (default %(default)s)")
+    p.add_argument("--no-timelapse", action="store_true", help="disable interval-timer (timelapse) grouping")
+    p.add_argument("--burst-gap", type=float, default=_DEFAULTS.bursts.max_link_gap,
+                   help="never join frames further apart than this many seconds into a burst (default %(default)s)")
     p.add_argument("--min-confidence", type=float, default=_DEFAULTS.min_confidence,
                    help="report exposure brackets below this confidence as singles (default %(default)s)")
     p.add_argument("--pixels", action="store_true",
@@ -48,7 +50,8 @@ def _add_common(p: argparse.ArgumentParser) -> None:
 def _config(a: argparse.Namespace) -> EngineConfig:
     return EngineConfig(max_gap=a.max_gap, manual_max_gap=a.manual_gap, max_size=a.max_size,
                         min_size=a.min_size, detect_focus=not a.no_focus, detect_bursts=not a.no_bursts,
-                        burst_max_gap=a.burst_gap, min_confidence=a.min_confidence)
+                        detect_timelapse=not a.no_timelapse,
+                        bursts=BurstConfig(max_link_gap=a.burst_gap), min_confidence=a.min_confidence)
 
 
 def _run(a: argparse.Namespace):

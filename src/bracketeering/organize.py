@@ -30,6 +30,8 @@ def folder_name(g: Group, index: int) -> str:
         return f"{stamp}_{stem}_HDR{g.size}x{g.step_ev:g}EV"
     if g.kind == "burst":
         return f"{stamp}_{stem}_BURST{g.size}"
+    if g.kind == "timelapse":
+        return f"{stamp}_{stem}_TIMELAPSE{g.size}"
     return f"{stamp}_{stem}_STACK{g.size}"
 
 

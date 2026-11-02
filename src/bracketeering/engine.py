@@ -29,7 +29,8 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from statistics import median
 
-from .model import Group, Shot
+from .bursts import BurstConfig, TimelapseConfig, form_bursts, form_timelapses
+from .model import Group, Shot, frame_step
 
 NEG_INF = float("-inf")
 
@@ -43,6 +44,7 @@ class EngineConfig:
     min_size: int = 2
     dup_tol: float = 0.16  # EV: frames closer than this count as the same exposure
     min_step: float = 0.28  # EV (1/3-stop brackets, allowing for rounding)
+    min_step_unsupported: float = 0.45  # EV: smaller steps need bracket metadata
     max_step: float = 4.2  # EV
     max_irregularity: float = 0.45  # max deviation of a step from the median step, as a fraction
     grid_tol: float = 0.08  # EV: how far a step may sit from the 1/3- or 1/2-stop grid
@@ -56,8 +58,9 @@ class EngineConfig:
     focus_max_gap: float = 1.5
     use_prior: bool = True
     detect_bursts: bool = True
-    burst_max_gap: float = 1.0  # s between frames of a burst (end of one exposure to start of next)
-    min_burst: int = 2
+    bursts: BurstConfig = field(default_factory=BurstConfig)
+    detect_timelapse: bool = True
+    timelapse: TimelapseConfig = field(default_factory=TimelapseConfig)
     min_confidence: float = 0.5  # exposure brackets below this are reported as singles
 
 
@@ -132,14 +135,7 @@ def _gap(a: Shot, b: Shot) -> float | None:
     return b.time - a.time - (a.meta.exposure_time or 0.0)
 
 
-def _frame_step(a: Shot, b: Shot) -> int | None:
-    fa, fb = a.meta.file_number, b.meta.file_number
-    if fa is None or fb is None:
-        return None
-    d = fb - fa
-    if d < 0 and fa > 9000 and fb < 1000:  # counter wrapped 9999 -> 0001
-        d += 10000 if fa < 10000 else 100000
-    return d
+_frame_step = frame_step
 
 
 def _is_manual(s: Shot) -> bool:
@@ -383,6 +379,10 @@ def _score_exposure(shots: list[Shot], ctx: _CameraContext, cfg: EngineConfig) -
         # Without metadata vouching for the group, demand what camera AEB
         # produces: a step on the 1/3- or 1/2-stop grid, each delta an exact
         # multiple of it (up to nominal shutter/aperture rounding).
+        if step < cfg.min_step_unsupported:
+            # A 1/3-stop series with no bracket metadata is indistinguishable from
+            # auto-exposure metering drift in a burst: never call it a bracket.
+            return _Eval(NEG_INF, "smallstep")
         if step < 0.6:
             score -= W.small_step
         grid_dev = min(abs(step - g) for g in _STEP_GRID)
@@ -520,7 +520,9 @@ def _in_burst(group: list[Shot], e: _Eval, neighbour: Shot, before: bool) -> boo
     gaps = [g for a, b in zip(group, group[1:]) if (g := _gap(a, b)) is not None]
     g = _gap(neighbour, group[0]) if before else _gap(group[-1], neighbour)
     if g is not None and gaps:
-        if g > 1.25 * max(gaps) + 0.05:
+        coarse = not all(s.meta.time_precise for s in (*group, neighbour))
+        # whole-second stamps: a neighbour one tick later can still be at the same cadence
+        if g > 1.25 * max(gaps) + (0.5 if coarse else 0.05):
             return False
     else:
         adjacent = _frame_step(neighbour, group[0]) if before else _frame_step(group[-1], neighbour)
@@ -601,66 +603,6 @@ def _dominant_signature(groups: list[Group]) -> Signature | None:
     return sig if count >= 2 and count >= 0.4 * total else None
 
 
-def _burst_linked(a: Shot, b: Shot, cfg: EngineConfig) -> bool:
-    ma, mb = a.meta, b.meta
-    if ma.lens and mb.lens and ma.lens != mb.lens:
-        return False
-    if not _rel_close(ma.focal_length, mb.focal_length, cfg.focal_tol):
-        return False
-    step = _frame_step(a, b)
-    if step is not None and not (0 <= step <= cfg.max_frame_skip):
-        return False
-    g = _gap(a, b)
-    if g is None:
-        return step == 1
-    limit = cfg.burst_max_gap + (0 if ma.time_precise and mb.time_precise else cfg.imprecise_slack)
-    return g <= limit
-
-
-def _burst_group(shots: list[Shot]) -> Group:
-    gaps = [g for a, b in zip(shots, shots[1:]) if (g := _gap(a, b)) is not None]
-    evidence = [f"{len(shots)} frames in quick succession"]
-    precise = all(s.meta.time_precise for s in shots)
-    if gaps and precise:
-        span = shots[-1].time - shots[0].time  # type: ignore[operator]
-        if span > 0:
-            evidence.append(f"{(len(shots) - 1) / span:.1f} fps")
-    evs = [s.ev for s in shots if s.ev is not None]
-    if len(evs) == len(shots):
-        evidence.append(f"exposure varies {max(evs) - min(evs):.2f} EV (metering, not a bracket)")
-    return Group("burst", shots, confidence=0.9 if precise else 0.7, evidence=evidence)
-
-
-def _form_bursts(groups: list[Group], cfg: EngineConfig) -> list[Group]:
-    """Merge chains of ungrouped frames shot at burst cadence into burst groups.
-
-    Runs after bracket detection, so bursts are whatever is fast but *not* a
-    bracket: frames the bracket scorer rejected (metering jitter, repeated
-    exposures) stay separate from real brackets.
-    """
-    out: list[Group] = []
-    buf: list[Shot] = []
-
-    def flush() -> None:
-        if len(buf) >= cfg.min_burst:
-            out.append(_burst_group(list(buf)))
-        else:
-            out.extend(Group("single", [s], confidence=1.0) for s in buf)
-        buf.clear()
-
-    for g in groups:
-        if g.kind == "single":
-            s = g.shots[0]
-            if buf and not _burst_linked(buf[-1], s, cfg):
-                flush()
-            buf.append(s)
-            continue
-        flush()
-        out.append(g)
-    flush()
-    return out
-
-
 def _pick_representative(g: Group) -> int:
     """Index of the frame that stands for the group (what a culler should look at)."""
     if g.kind == "exposure":
@@ -669,7 +611,7 @@ def _pick_representative(g: Group) -> int:
             ordered = sorted(evs)  # type: ignore[type-var]
             mid = ordered[(len(ordered) - 1) // 2] if len(ordered) % 2 else (ordered[len(ordered) // 2 - 1] + ordered[len(ordered) // 2]) / 2
             return min(range(g.size), key=lambda i: (abs(evs[i] - mid), abs(g.shots[i].meta.exposure_bias or 0.0), i))  # type: ignore[operator]
-    if g.kind in ("focus", "burst"):
+    if g.kind in ("focus", "burst", "timelapse"):
         return g.size // 2
     return 0
 
@@ -694,7 +636,7 @@ def _annotate(groups: list[Group], prior: Signature | None) -> None:
 
 
 def detect(shots: list[Shot], cfg: EngineConfig | None = None) -> list[Group]:
-    """Partition shots into exposure brackets, focus stacks, bursts and singles."""
+    """Partition shots into exposure brackets, focus stacks, bursts, timelapses and singles."""
     cfg = cfg or EngineConfig()
     by_cam: dict[tuple[str, str, str], list[Shot]] = defaultdict(list)
     for s in shots:
@@ -711,8 +653,10 @@ def detect(shots: list[Shot], cfg: EngineConfig | None = None) -> list[Group]:
             groups = [g for run in runs for g in _segment_run(run, ctx, cfg, prior, cache)]
         groups = _demote_low_confidence(groups, cfg)
         _annotate(groups, prior)
+        if cfg.detect_timelapse:  # before bursts: regular at >= 1 s is a timer, not a drive
+            groups = form_timelapses(groups, cfg.timelapse)
         if cfg.detect_bursts:
-            groups = _form_bursts(groups, cfg)
+            groups = form_bursts(groups, cfg.bursts)
         result.extend(groups)
     result.sort(key=lambda g: _order_key(g.shots[0]))
     for g in result:

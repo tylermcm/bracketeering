@@ -8,7 +8,7 @@
 |---|---|---|
 | `schema` | `"bracketeering/2"` | format version |
 | `tool_version` | string | package version that produced the file |
-| `summary` | object | counts: `shots`, `files`, `exposure_brackets`, `focus_stacks`, `bursts`, `singles`, `near_duplicate_scenes`, `unreadable` |
+| `summary` | object | counts: `shots`, `files`, `exposure_brackets`, `focus_stacks`, `bursts`, `timelapses`, `singles`, `near_duplicate_scenes`, `unreadable` |
 | `groups` | array | every shot belongs to exactly one group, singles included, in capture order |
 | `files` | object | per-file index keyed by path; **every input file appears exactly once** |
 | `errors` | array | `{file, error}` for files whose metadata could not be read (they still appear in `files`, as singles) |
@@ -17,13 +17,13 @@
 
 | key | type | meaning |
 |---|---|---|
-| `id` | string | `B…` exposure bracket, `U…` burst, `F…` focus stack, `S…` single |
-| `kind` | `"exposure"` \| `"burst"` \| `"focus"` \| `"single"` | group type |
+| `id` | string | `B…` exposure bracket, `U…` burst, `T…` timelapse, `F…` focus stack, `S…` single |
+| `kind` | `"exposure"` \| `"burst"` \| `"timelapse"` \| `"focus"` \| `"single"` | group type |
 | `size` | int | number of shots (a RAW+JPEG pair is one shot) |
-| `confidence` | float 0–1 | detection confidence (1.0 for singles) |
+| `confidence` | float 0–1 | detection confidence (1.0 for singles). For bursts it is the log-odds of "one press of the shutter" vs "separate presses", squashed to 0–1. On simulated shoots, bursts at ≥ 0.9 were exactly right 95% of the time and those at 0.5–0.7 about 77% |
 | `camera` | string \| null | make + model |
 | `start` | ISO time \| null | capture time of the first frame (UTC if the file records an offset, else camera-local) |
-| `representative` | path | the frame that stands for the group. Exposure brackets: the middle exposure (≈ 0 EV). Bursts and focus stacks: the middle frame. |
+| `representative` | path | the frame that stands for the group. Exposure brackets: the middle exposure (≈ 0 EV). Bursts, timelapses and focus stacks: the middle frame. |
 | `best_exposed` | path \| null | exposure brackets with `--pixels`: brightest frame whose highlights hold (expose to the right) |
 | `scene` | int \| null | with `--pixels`: near-duplicate scene id. Groups sharing an id are the same subject shot repeatedly |
 | `ev_offsets` | float[] \| null | exposure brackets: each frame's offset in stops from the middle exposure, in capture order |
@@ -51,6 +51,7 @@
 
 - **The user doesn't target brackets:** for every file whose `kind == "exposure"`, keep the whole group as one unit (e.g. for HDR merging).
 - **Brackets are targeted, one frame wanted:** use `best_exposed` when present, otherwise `representative`.
-- **Bursts:** the group is a set of alternatives. Rank its frames (sharpness, then aesthetics) and keep the best.
+- **Bursts:** one press of the shutter in continuous drive. The group is a set of alternatives: rank its frames (sharpness, then aesthetics) and keep the best. Two presses separated by a short pause are two bursts. Groups sharing a `scene` id are the same subject.
+- **Timelapses:** interval-timer sequences, where every frame is part of the sequence. These are usually excluded from culling rather than reduced to one frame.
 - **Near-duplicates:** groups sharing a `scene` id are alternatives of the same subject. Compare their representatives against each other, not against unrelated photos.
 - **Confidence:** pass `--min-confidence` to have weak bracket candidates reported as singles instead. A wrong merge costs more in culling than a missed bracket.

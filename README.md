@@ -1,6 +1,6 @@
 # bracketeering
 
-Fast, accurate detection and grouping of camera **exposure brackets** (AEB / HDR sets), **bursts** and **focus stacks** from a folder of photos. Optionally, it also finds **near-duplicate scenes** and per-frame **exposure problems**.
+Fast, accurate detection and grouping of camera **exposure brackets** (AEB / HDR sets), **bursts** (continuous-drive sequences), **timelapses** (interval-timer sequences) and **focus stacks** from a folder of photos. Optionally, it also finds **near-duplicate scenes** and per-frame **exposure problems**.
 
 It's built as the grouping step of a photo-culling pipeline. Every file gets a group, a kind and a role, so the next stage knows which frames are alternatives of one another and which single frame stands for each group. The JSON contract is documented in [SCHEMA.md](SCHEMA.md).
 
@@ -53,7 +53,7 @@ Useful options:
 - `--burst-gap`: seconds between burst frames (default 1)
 - `--min-confidence`: weaker bracket candidates become singles (default 0.5)
 - `--scene-window`, `--hash-threshold`: near-duplicate tuning
-- `--max-size`, `--min-size`, `--no-focus`, `--no-bursts`
+- `--max-size`, `--min-size`, `--no-focus`, `--no-bursts`, `--no-timelapse`
 
 `organize` creates one folder per group, for example `20240501-120000_IMG_0412_HDR5x1EV/` or `…_BURST9/`. It keeps RAW+JPEG sidecars together and never overwrites existing files.
 
@@ -89,29 +89,69 @@ from bracketeering.report import to_dict    # the SCHEMA.md structure, ready for
    - **Context.** Groups that change two exposure variables at once, change white balance or fire a flash are penalised. A large time gap favours a boundary there.
    - **Burst veto.** Auto-exposure bursts wander in 1/3-stop increments and can look like small brackets. A group without metadata support is dissolved if ungrouped frames, or groups with a different signature, sit next to it at the same cadence and exposure level.
 6. **Second pass with a prior.** Photographers rarely change bracket settings mid-shoot. The camera's dominant signature (size, firing order, step) becomes a prior, and the DP runs again. This settles the hard cases, such as back-to-back brackets fired in continuous drive with no pause. Group evaluations are cached, so the second pass costs almost nothing.
-7. **Bursts.** After brackets are settled, chains of leftover frames shot at burst cadence (≤ `burst_max_gap` apart, same lens and focal length) become burst groups. Because bracket detection runs first, a burst is "fast, but not a bracket". That's how metering-jitter bursts and repeated exposures are kept apart from real brackets.
-8. **Representatives.** Each group gets a representative frame. For brackets it's the middle exposure (≈ 0 EV); for bursts and stacks it's the middle frame.
-9. **Pixels (optional).** Embedded previews are found in each container (JPEG `APP1`, TIFF/NEF/ARW/DNG/CR2 preview IFDs and SubIFDs, RW2 `JpgFromRaw`, RAF, CR3 `PRVW`). Lossless-JPEG raw data is skipped. Each preview is decoded at reduced size, and the engine computes:
+7. **Timelapses.** Leftover frames fired at a fixed interval of ≥ 1 s (within 1% + 40 ms; ≥ 2 s for whole-second timestamps), at least 5 in a row, become a timelapse. Continuous drive is never that slow, and timers are far more precise than any drive or human. A slowing burst can't be mistaken for one, because a timelapse doesn't start right on the heels of a drive-speed frame.
+8. **Bursts** (`bursts.py`). A burst is **one press of the shutter in continuous drive**. It's detected with a probabilistic sequence model that gets the same care as brackets:
+   - Leftover frames are chained: same body and lens, consecutive frame numbers, ≤ 2.5 s apart. Every interval in a chain is explained as either **drive** or **break**.
+     - **Drive:** the camera fired the next frame. The interval sits near the burst's local cadence, with a few % jitter and occasional autofocus/buffer slowdowns, and the cadence fits a drive rate prior (~1–60 fps).
+     - **Break:** a separate press. The pause follows a log-normal (~0.9 s typical), and pauses under ~0.2 s are rare because humans can't re-press that fast.
+   - Both sides are densities over the same intervals, so dynamic programming finds the most likely labelling: which frames are bursts, and exactly where each burst starts and ends.
+   - A burst may **change pace** without splitting (a 20 fps burst that drops to 5 fps when the buffer fills, or zooming). An interval at the *new* pace is a drive interval; a pause that fits neither pace is a re-press.
+   - With slow shutters, the drive fires "exposure + fixed overhead" apart, so regularity is judged on the dead time between frames.
+   - **Metadata** (with `--backend exiftool`): continuous vs single drive, and the burst **sequence number**, where a reset to 1 forces a new burst. That separates back-to-back presses even without sub-second times. Zoom changes, exposure jumps and frame-counter gaps count against "same press".
+   - **Pixels** (with `--pixels`): a subject change between consecutive previews splits a burst, even at full drive speed.
+   - **Coarse timestamps:** without sub-seconds, the model uses the probability of landing in the same or next second, a decaying probability for several separate presses within one second, and an edge prior (a separate press right next to a running burst is unlikely).
+   - **Confidence** is the log-odds of "one press" vs "separate presses". On simulated shoots, bursts at ≥ 0.9 were exactly right 95% of the time.
+9. **Representatives.** Each group gets a representative frame. For brackets it's the middle exposure (≈ 0 EV); for bursts, timelapses and stacks it's the middle frame.
+10. **Pixels (optional).** Embedded previews are found in each container (JPEG `APP1`, TIFF/NEF/ARW/DNG/CR2 preview IFDs and SubIFDs, RW2 `JpgFromRaw`, RAF, CR3 `PRVW`). Lossless-JPEG raw data is skipped. Each preview is decoded at reduced size, and the engine computes:
    - **Exposure stats** per frame: highlight clipping (any channel ≥ 250), crushed shadows, mean level, and an `ok`/`over`/`under` flag.
    - **`best_exposed`** per bracket: the brightest frame whose highlights hold (≤ 0.5% clipped), i.e. expose to the right. Of the usable frames it has the cleanest shadows.
    - **Near-duplicate scenes:** consecutive groups from one body, at most `scene_window` apart, whose representatives have a similar perceptual hash (dHash). Gradient-based hashing tolerates exposure differences.
 
 ## Accuracy
 
-`scripts/benchmark.py` simulates realistic shoots with known ground truth. The simulator includes AEB in several firing orders and both drive modes, back-to-back brackets, deleted frames, hand-adjusted manual brackets, auto-exposure bursts with metering jitter, focus stacks, single shots, and quick handheld pairs with an exposure tweak. Shutter speeds are quantised to real nominal values. Results over 20 seeds (~4,000 brackets and ~900 bursts per profile):
+`scripts/benchmark.py` runs two simulators with known ground truth. These numbers come from simulators written alongside the engine, so they reflect its assumptions about camera behaviour. Real shoots are the true test.
+
+### Bracket shoots
+
+These include AEB in several firing orders and both drive modes, back-to-back brackets, deleted frames, hand-adjusted manual brackets, continuous-drive bursts with auto-exposure, focus stacks, singles, and quick handheld pairs. Shutter speeds are quantised to real nominal values. Results over 20 seeds (~4,000 brackets and ~900 bursts per profile):
 
 | profile | what's hard about it | bracket precision | bracket recall | burst recall | burst→bracket | bracket→burst |
 |---|---|---|---|---|---|---|
-| canon-aeb | baseline: full metadata | 0.999 | 0.999 | 1.000 | 0.00% | 0.01% |
-| sony-no-subsec | timestamps only to the second | 0.999 | 0.999 | 0.952 | 0.00% | 0.02% |
-| nikon-mixed-settings | size 2–9 and step ⅓–3 EV change every bracket | 0.991 | 0.982 | 1.000 | 0.00% | 0.10% |
-| manual-brackets | user-driven brackets, 1–4 s apart, no bracket flags | 0.996 | 0.979 | 0.994 | 0.27% | 0.35% |
-| no-bracket-metadata | no ExposureMode, no exposure compensation, AE bursts | 0.979 | 0.968 | 0.997 | 0.15% | 0.76% |
-| worst-case | all of the above, no sub-seconds, 50% back-to-back | 0.980 | 0.964 | 0.941 | 0.71% | 1.52% |
+| canon-aeb | baseline: full metadata | 0.999 | 0.999 | 0.962 | 0.00% | 0.00% |
+| sony-no-subsec | timestamps only to the second | 1.000 | 1.000 | 0.914 | 0.00% | 0.00% |
+| nikon-mixed-settings | size 2–9 and step ⅓–3 EV change every bracket | 0.993 | 0.985 | 0.971 | 0.00% | 0.02% |
+| manual-brackets | user-driven brackets, 1–4 s apart, no bracket flags | 0.998 | 0.982 | 0.962 | 0.04% | 0.13% |
+| no-bracket-metadata | no ExposureMode, no exposure compensation | 0.983 | 0.973 | 0.969 | 0.00% | 0.49% |
+| worst-case | all of the above, no sub-seconds, 50% back-to-back | 0.975 | 0.951 | 0.910 | 0.26% | 0.94% |
 
-Precision and recall are for exact groups: the predicted group contains exactly the right frames. The last two columns measure confusion between the two kinds: the share of burst frames wrongly placed in a bracket, and of bracket frames wrongly placed in a burst. Without sub-second timestamps, a burst sometimes absorbs a neighbouring single. That's why burst recall is lower in those profiles.
+### Action shoots (burst-focused)
 
-These numbers come from a simulator written alongside the engine, so they reflect its assumptions about camera behaviour. Real shoots are the true test. Most remaining errors are inherently ambiguous without metadata, for example a 1/3-EV bracket next to an auto-exposure burst. Use `--backend exiftool` when maker notes are available.
+These include:
+- continuous drive at 1.5–60 fps with 3% jitter;
+- autofocus hiccups;
+- buffer slowdowns (2–4× slower after 15–80 frames);
+- bursts of 2–120 frames;
+- re-presses after 0.25–1.5 s pauses (which must be separate bursts);
+- quick human taps and interval-timer sequences (which must not be bursts);
+- zoom changes and pans to a new subject mid-burst;
+- AEB sets mixed in.
+
+Results over 20 seeds (~3,900 bursts per profile):
+
+| profile | burst precision | burst recall | merged | split | taps/timer → burst | bracket recall | timelapse recall |
+|---|---|---|---|---|---|---|---|
+| action (sub-second times, no maker notes) | 0.946 | 0.907 | 3.1% | 3.3% | 0.96% | 1.000 | 1.000 |
+| action-drive-meta (`--backend exiftool`) | 0.978 | 0.988 | 0.0% | 1.2% | 0.00% | 1.000 | 1.000 |
+| action-pixels (`--pixels`, with pans) | 0.946 | 0.901 | 3.3% | 3.4% | 0.93% | 1.000 | 1.000 |
+| action-no-subsec-meta | 0.996 | 0.980 | 0.0% | 2.0% | 0.00% | 1.000 | 0.778 |
+| action-no-subsec (no maker notes) | 0.648 | 0.362 | 32.7% | 17.2% | 0.00% | 1.000 | 0.778 |
+
+Precision and recall are for exact groups: a predicted burst must contain exactly the right frames. "Merged" counts predicted bursts that join two real presses; "split" counts real bursts broken apart.
+
+**What limits burst accuracy:**
+- **With sub-second timestamps:** most remaining errors are genuinely ambiguous. Examples: a 2-frame burst at 3 fps vs two quick taps, a re-press pause barely longer than an autofocus hiccup, or a slow burst with a hiccup on its first frame.
+- **Cameras that record only whole seconds and no maker notes:** this is the hard limit. A re-press less than a second after the previous burst is invisible in the timestamps; it accounts for most of the errors in that row. The camera's burst **sequence numbers** solve it completely (0.996 / 0.980 with them), so **use `--backend exiftool` for such cameras**. In the bracket simulator's no-subsec profiles, a burst sometimes absorbs a neighbouring single for the same reason.
+- **Without metadata, ⅓-stop exposure series are never called brackets**, because they're indistinguishable from auto-exposure metering drift inside a burst. Brackets with a ⅔-stop step or larger, or with any bracket metadata, are unaffected.
 
 ```bash
 python scripts/benchmark.py --seeds 20
@@ -125,7 +165,8 @@ src/bracketeering/
   metadata/native.py    dependency-free EXIF reader (JPEG/TIFF/RAW/RAF/CR3)
   metadata/exiftool.py  batched exiftool backend + maker-note normalisation
   scan.py               file discovery, RAW+JPEG pairing
-  engine.py             run splitting, scoring, DP segmentation, priors, bursts
+  engine.py             bracket detection: run splitting, scoring, DP segmentation, priors
+  bursts.py             burst model (drive vs break, pace changes) + timelapse detection
   preview.py            embedded JPEG preview extraction
   pixels.py             exposure stats, best-exposed pick, near-duplicate scenes
   report.py             text / JSON (SCHEMA.md) / CSV output
@@ -140,7 +181,8 @@ src/bracketeering/
 - The native reader doesn't decode maker notes. Bracket detection still works from EXIF and exposure analysis, but maker-note shot positions need `--backend exiftool`.
 - HEIC/HEIF and less common RAW containers fall back to exiftool when it's installed. Without exiftool, they're reported as unreadable.
 - White-balance and flash brackets are not grouped as exposure brackets. ISO brackets (auto-ISO AEB) are.
-- ⅓-stop brackets need metadata support (EXIF auto-bracket flag, maker notes or matching exposure compensation). Without it, a ⅓-stop series looks the same as metering drift in a burst, so it isn't grouped.
+- ⅓-stop brackets need metadata support (EXIF auto-bracket flag, maker notes or matching exposure compensation). Without it, a ⅓-stop series looks the same as metering drift in a burst, so it is never grouped as a bracket.
+- A timelapse needs at least 5 frames. Shorter interval-timer runs fall back to singles.
 - Depth-of-field series (several apertures at the *same* exposure, with the shutter compensating) aren't exposure brackets. They come out as a burst or singles.
 - Pixel exposure stats come from the camera's JPEG preview, which clips highlights earlier than the RAW does, so `over` is conservative. Treat the stats as a triage signal, not a RAW-accurate measurement.
 - Near-duplicate detection only links *consecutive* groups from the same body within `scene_window`. Returning to a subject after shooting something else starts a new scene.

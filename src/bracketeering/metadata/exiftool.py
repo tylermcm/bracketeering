@@ -28,7 +28,7 @@ TAGS = [
     "-EXIF:ExposureMode#", "-ExposureProgram#", "-FocalLength#", "-EXIF:WhiteBalance#",
     "-Flash#", "-FocusDistance#", "-SubjectDistance#", "-ApproximateFocusDistance#",
     "-*Bracket*", "-SequenceNumber", "-*ShotNumber*", "-DriveMode", "-ReleaseMode*",
-    "-ShootingMode", "-FocusShift*",
+    "-ShootingMode", "-FocusShift*", "-ContinuousDrive", "-BurstMode",
 ]
 
 _MODE_KEYS = {"drivemode", "releasemode", "releasemode2", "releasemode3", "shootingmode", "bracketsettings"}
@@ -55,6 +55,47 @@ def _kind_from_text(text: str) -> str:
     if re.search(r"\biso\b", t):
         return "iso"
     return "exposure"
+
+
+_DRIVE_KEYS = ("continuousdrive", "drivemode", "releasemode", "releasemode2", "releasemode3", "shootingmode", "burstmode")
+_CONTINUOUS_RE = re.compile(r"continuous|burst|sequential|high[- ]speed|low[- ]speed|\bc[hlm]\b|\bon\b|infinite|unlimited", re.I)
+_SINGLE_RE = re.compile(r"single|normal|\boff\b|timer|remote", re.I)
+
+
+def classify_drive(record: dict) -> tuple[str | None, int | None]:
+    """Derive (drive_mode, sequence_number) from maker-note drive tags.
+
+    Canon ContinuousDrive, Sony ReleaseMode*, Nikon ShootingMode, Fujifilm and
+    Pentax DriveMode, Olympus DriveMode ("Continuous Shooting, Shot 3"),
+    Panasonic BurstMode; SequenceNumber is the frame index within a burst.
+    """
+    lowered = {k.lower(): str(v) for k, v in record.items()}
+    drive: str | None = None
+    for key in _DRIVE_KEYS:
+        v = lowered.get(key)
+        if v is None:
+            continue
+        if _CONTINUOUS_RE.search(v) and not re.search(r"no burst|\bsingle\b", v, re.I):
+            drive = "continuous"
+            break
+        if _SINGLE_RE.search(v):
+            drive = drive or "single"
+    seq: int | None = None
+    raw = lowered.get("sequencenumber")
+    if raw is not None:
+        try:
+            n = int(float(raw))
+            seq = n if n > 0 else None
+        except ValueError:
+            seq = None
+    if seq is None:
+        for key in ("drivemode", "releasemode2", "releasemode3"):
+            if (v := lowered.get(key)) and (m := _SHOT_RE.search(v)):
+                seq = int(m.group(1))
+                break
+    if drive == "single":
+        seq = None
+    return drive, seq
 
 
 def classify_bracket(record: dict) -> tuple[str | None, int | None]:
@@ -126,6 +167,7 @@ def meta_from_record(rec: dict) -> FileMeta:
         rec.get("DateTimeOriginal"), str(rec.get("SubSecTimeOriginal", "")) or None, rec.get("OffsetTimeOriginal")
     )
     kind, pos = classify_bracket(rec)
+    drive, seq = classify_drive(rec)
     flash = _f(rec.get("Flash"))
     dist = None
     for k in ("FocusDistance", "ApproximateFocusDistance", "SubjectDistance"):
@@ -154,6 +196,8 @@ def meta_from_record(rec: dict) -> FileMeta:
         focus_distance=dist,
         bracket_kind=kind,
         bracket_position=pos,
+        drive_mode=drive,
+        sequence_number=seq,
         reader="exiftool",
     )
 

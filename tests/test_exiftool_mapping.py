@@ -39,3 +39,22 @@ def test_meta_from_record():
     assert m.time_precise and m.capture_time % 1 == pytest.approx(0.45)
     assert (m.bracket_kind, m.bracket_position) == ("exposure", 2)
     assert m.exposure_mode == 2 and m.file_number == 7
+
+
+@pytest.mark.parametrize("record,expected", [
+    ({"ContinuousDrive": "Continuous, High"}, ("continuous", None)),
+    ({"ContinuousDrive": "Single"}, ("single", None)),
+    ({"ReleaseMode": "Normal"}, ("single", None)),
+    ({"ReleaseMode2": "Continuous - Hi", "SequenceNumber": 4}, ("continuous", 4)),
+    ({"ShootingMode": "Single-Frame"}, ("single", None)),
+    ({"ShootingMode": "Continuous, Exposure Bracketing"}, ("continuous", None)),
+    ({"DriveMode": "Continuous Shooting, Shot 3"}, ("continuous", 3)),
+    ({"DriveMode": "Continuous Low", "SequenceNumber": 0}, ("continuous", None)),
+    ({"BurstMode": "Off"}, ("single", None)),
+    ({"BurstMode": "On", "SequenceNumber": 2}, ("continuous", 2)),
+    ({"DriveMode": "Self-timer (12 sec)"}, ("single", None)),
+    ({}, (None, None)),
+])
+def test_classify_drive(record, expected):
+    from bracketeering.metadata.exiftool import classify_drive
+    assert classify_drive(record) == expected

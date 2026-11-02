@@ -15,7 +15,7 @@ from . import __version__
 from .model import FileMeta, Group, Shot
 
 SCHEMA = "bracketeering/2"
-_PREFIX = {"exposure": "B", "focus": "F", "burst": "U", "single": "S"}
+_PREFIX = {"exposure": "B", "focus": "F", "burst": "U", "timelapse": "T", "single": "S"}
 
 
 def _fmt_time(t: float | None) -> str | None:
@@ -99,7 +99,7 @@ def to_dict(groups: list[Group], errors: list[FileMeta] | None = None) -> dict:
                     "best_exposed": (pos == g.best_exposed) if g.best_exposed is not None else None,
                     "error": errs.get(key),
                 }
-    count = {k: sum(g.kind == k for g in groups) for k in ("exposure", "focus", "burst", "single")}
+    count = {k: sum(g.kind == k for g in groups) for k in ("exposure", "focus", "burst", "timelapse", "single")}
     return {
         "schema": SCHEMA,
         "tool_version": __version__,
@@ -109,6 +109,7 @@ def to_dict(groups: list[Group], errors: list[FileMeta] | None = None) -> dict:
             "exposure_brackets": count["exposure"],
             "focus_stacks": count["focus"],
             "bursts": count["burst"],
+            "timelapses": count["timelapse"],
             "singles": count["single"],
             "near_duplicate_scenes": sum(n > 1 for n in scene_sizes.values()),
             "unreadable": len(errs),
@@ -158,6 +159,8 @@ def to_text(groups: list[Group], errors: list[FileMeta] | None = None, verbose: 
             head = f"{group_id(i, g)}  bracket  {g.size} frames  step {g.step_ev} EV  [{offs}]  conf {g.confidence:.2f}"
         elif g.kind == "burst":
             head = f"{group_id(i, g)}  burst    {g.size} frames  conf {g.confidence:.2f}"
+        elif g.kind == "timelapse":
+            head = f"{group_id(i, g)}  timelapse {g.size} frames  conf {g.confidence:.2f}"
         else:
             head = f"{group_id(i, g)}  focus    {g.size} frames  conf {g.confidence:.2f}"
         lines.append(head + scene)
@@ -172,7 +175,7 @@ def to_text(groups: list[Group], errors: list[FileMeta] | None = None, verbose: 
     lines.append("")
     lines.append(
         f"{d['shots']} shots ({d['files']} files): {d['exposure_brackets']} exposure brackets, "
-        f"{d['bursts']} bursts, {d['focus_stacks']} focus stacks, {d['singles']} singles"
+        f"{d['bursts']} bursts, {d['timelapses']} timelapses, {d['focus_stacks']} focus stacks, {d['singles']} singles"
         + (f", {d['near_duplicate_scenes']} near-duplicate scenes" if any(g.scene is not None for g in groups) else "")
         + (f", {d['unreadable']} unreadable" if d["unreadable"] else "")
         + "   (* = representative frame)"

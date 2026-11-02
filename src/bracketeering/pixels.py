@@ -106,19 +106,28 @@ def _hamming(a: int, b: int) -> int:
     return (a ^ b).bit_count()
 
 
-def analyse_groups(groups: list[Group], cfg: PixelConfig = PixelConfig(), workers: int | None = None) -> None:
-    """Attach PixelStats to every shot, then fill best_exposed and scene on the groups."""
+def analyse_shots(shots: list[Shot], cfg: PixelConfig = PixelConfig(), workers: int | None = None) -> None:
+    """Attach PixelStats to every shot (run before grouping, so bursts can split on subject changes)."""
     if not available():
         raise RuntimeError("pixel analysis needs Pillow: pip install pillow")
-    shots: list[Shot] = [s for g in groups for s in g.shots]
     workers = workers or min(32, (os.cpu_count() or 4) * 2)
     with ThreadPoolExecutor(max_workers=workers) as pool:  # Pillow releases the GIL while decoding
         for s, st in zip(shots, pool.map(lambda s: analyse_file(s.meta.path, cfg), shots)):
             s.pixels = st
+
+
+def finish_groups(groups: list[Group], cfg: PixelConfig = PixelConfig()) -> None:
+    """Fill best_exposed and scene on groups whose shots already carry PixelStats."""
     for g in groups:
         if g.kind == "exposure":
             g.best_exposed = pick_best_exposed(g, cfg)
     assign_scenes(groups, cfg)
+
+
+def analyse_groups(groups: list[Group], cfg: PixelConfig = PixelConfig(), workers: int | None = None) -> None:
+    """Pixel-analyse already-grouped shots, then fill best_exposed and scene."""
+    analyse_shots([s for g in groups for s in g.shots], cfg, workers)
+    finish_groups(groups, cfg)
 
 
 def pick_best_exposed(g: Group, cfg: PixelConfig = PixelConfig()) -> int | None:

@@ -32,11 +32,15 @@ def analyze(
     metas = read_many(files, backend=backend, workers=workers)
     errors = [m for m in metas if m.error]
     shots = pair_sidecars(metas)
-    groups = detect(shots, config)
     if pixels:
-        from .pixels import PixelConfig, analyse_groups
+        from .pixels import PixelConfig, analyse_shots, finish_groups
 
-        analyse_groups(groups, pixel_config or PixelConfig(), workers=workers)
+        pcfg = pixel_config or PixelConfig()
+        analyse_shots(shots, pcfg, workers=workers)
+        groups = detect(shots, config)
+        finish_groups(groups, pcfg)
+    else:
+        groups = detect(shots, config)
     return groups, errors
 
 

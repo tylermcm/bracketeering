@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .engine import known_orders
@@ -160,10 +160,12 @@ def generate_labeled(profile: Profile, n_events: int = 200, seed: int = 0) -> tu
             truth.append(set(names))
         elif r < profile.p_bracket + profile.p_manual + profile.p_burst:
             burst = set()
-            for _ in range(rng.randint(4, 15)):  # AE burst with metering jitter
+            fps, overhead = rng.choice((5, 8, 10, 12)), rng.uniform(0.04, 0.1)
+            for _ in range(rng.randint(4, 15)):  # continuous-drive burst; AE meters each frame
                 exp_t = nominal_shutter(base + rng.gauss(0, 0.35))
                 burst.add(emit(exp_t, 100, 0, 0.0))
-                t += exp_t + rng.uniform(0.05, 0.15)
+                # the drive fires at its rate, or exposure + fixed overhead when the shutter is slow
+                t += max(1 / fps, exp_t + overhead) * (1 + rng.gauss(0, 0.03))
                 base += rng.gauss(0, 0.15)
             bursts.append(burst)
         elif r < profile.p_bracket + profile.p_manual + profile.p_burst + profile.p_focus:
@@ -250,3 +252,234 @@ def evaluate_bursts(groups: list[Group], bursts: list[set[str]], brackets: list[
         bracket_frames=len(bracket_names),
         bracket_frames_in_bursts=sum(kind_of.get(n) == "burst" for n in bracket_names),
     )
+
+
+# --------------------------------------------------------------------------------------
+# Action / event shooting: the burst-focused simulator
+# --------------------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class ActionProfile:
+    name: str
+    subsec: bool = True
+    drive_meta: bool = False  # drive mode + burst sequence numbers (exiftool backend)
+    hashes: bool = False  # simulate --pixels preview hashes (enables subject-change pans)
+    fps: tuple[float, ...] = (3, 5, 8, 10, 12, 15, 20, 30)
+    p_burst: float = 0.35
+    p_repress: float = 0.35  # a burst is followed by another press after a short pause
+    repress_pause: tuple[float, float] = (0.25, 1.5)
+    p_taps: float = 0.15
+    p_slow: float = 0.07
+    p_bracket: float = 0.08
+    p_interval: float = 0.03
+    p_hiccup: float = 0.04
+    p_zoom: float = 0.1
+    p_pan: float = 0.0
+
+
+ACTION_PROFILES = {
+    "action": ActionProfile("action"),
+    "action-drive-meta": ActionProfile("action-drive-meta", drive_meta=True),
+    "action-pixels": ActionProfile("action-pixels", hashes=True, p_pan=0.12),
+    "action-no-subsec": ActionProfile("action-no-subsec", subsec=False),
+    "action-no-subsec-meta": ActionProfile("action-no-subsec-meta", subsec=False, drive_meta=True),
+    "action-worst": ActionProfile("action-worst", subsec=False, p_repress=0.6, repress_pause=(0.2, 0.8),
+                                  p_taps=0.25, p_hiccup=0.08),
+}
+
+
+@dataclass(slots=True)
+class ActionTruth:
+    brackets: list[set[str]]
+    bursts: list[set[str]]
+    not_bursts: set[str]  # frames that must not be in any burst (taps, interval timer)
+    timelapses: list[set[str]] = field(default_factory=list)
+
+
+def generate_action(profile: ActionProfile, n_events: int = 200, seed: int = 0) -> tuple[list[Shot], ActionTruth]:
+    from .pixels import PixelStats
+
+    rng = random.Random(seed)
+    t = 1_700_000_000.0 + rng.random() * 1e6
+    counter = rng.randint(1, 9000)
+    shots: list[Shot] = []
+    truth = ActionTruth([], [], set())
+    focal = 200.0
+    subject = rng.getrandbits(64)
+    base = math.log2(1 / 1000)
+
+    def frame_hash() -> int:
+        h = subject
+        for _ in range(rng.randint(0, 5)):
+            h ^= 1 << rng.randrange(64)
+        return h
+
+    def emit(exp_t: float, *, mode: int = 0, bias: float = 0.0, drive: str = "single", seq: int | None = None) -> str:
+        nonlocal counter
+        counter = counter % 9999 + 1
+        name = f"IMG_{counter:04d}.CR3"
+        m = FileMeta(
+            path=Path(name), make="Canon", model="EOS R3", serial="42", lens="RF100-500mm",
+            capture_time=t if profile.subsec else math.floor(t), time_precise=profile.subsec,
+            exposure_time=exp_t, f_number=5.6, iso=800, exposure_bias=bias, exposure_mode=mode,
+            exposure_program=3, focal_length=focal, white_balance=0, flash_fired=False,
+            drive_mode=drive if profile.drive_meta else None,
+            sequence_number=seq if profile.drive_meta else None,
+        )
+        s = Shot([m])
+        if profile.hashes:
+            s.pixels = PixelStats(frame_hash(), 0.0, 0.0, 0.4, "ok")
+        shots.append(s)
+        return name
+
+    def burst(fps: float, n: int) -> None:
+        nonlocal t, base, focal, subject
+        cadence = 1 / fps
+        buffer_depth = rng.randint(15, 80)
+        slow = 1.0
+        current: list[str] = []
+        pan_at = rng.randrange(2, n - 1) if profile.hashes and n >= 5 and rng.random() < profile.p_pan else -1
+        zoom_at = rng.randrange(1, n) if n >= 3 and rng.random() < profile.p_zoom else -1
+        for i in range(n):
+            if i == pan_at:  # swing to a new subject mid-burst: for culling these are different moments
+                if len(current) >= 2:
+                    truth.bursts.append(set(current))
+                current = []
+                subject = rng.getrandbits(64)
+            if i == zoom_at:
+                focal = round(focal * rng.choice([0.8, 1.25]), 1)
+            base += rng.gauss(0, 0.08)
+            exp_t = nominal_shutter(base)
+            current.append(emit(exp_t, drive="continuous", seq=i + 1))
+            if i >= buffer_depth:
+                slow = max(slow, rng.uniform(2.0, 4.0))
+            iv = cadence * slow * (1 + rng.gauss(0, 0.03))
+            if rng.random() < profile.p_hiccup:
+                iv *= rng.uniform(1.4, 2.5)
+            t += max(iv, exp_t + 0.002)
+        if len(current) >= 2:
+            truth.bursts.append(set(current))
+
+    def burst_length() -> int:
+        r = rng.random()
+        return rng.randint(2, 4) if r < 0.25 else rng.randint(5, 12) if r < 0.7 else rng.randint(13, 40) if r < 0.95 else rng.randint(41, 120)
+
+    for _ in range(n_events):
+        if rng.random() < 0.3:
+            t += rng.uniform(20, 600)
+            focal = rng.choice([100.0, 200.0, 300.0, 400.0, 500.0])
+            subject = rng.getrandbits(64)
+            base = rng.uniform(math.log2(1 / 4000), math.log2(1 / 250))
+        else:
+            t += rng.uniform(1.5, 15)
+            if rng.random() < 0.3:
+                subject = rng.getrandbits(64)
+        r = rng.random()
+        p = profile
+        if r < p.p_burst:
+            fps = rng.choice(p.fps)
+            burst(fps, burst_length())
+            while rng.random() < p.p_repress:  # release and press again
+                t += rng.uniform(*p.repress_pause)
+                burst(fps, burst_length())
+        elif r < p.p_burst + p.p_taps:
+            for _ in range(rng.randint(2, 5)):  # quick separate presses
+                truth.not_bursts.add(emit(nominal_shutter(base + rng.gauss(0, 0.1))))
+                t += rng.uniform(0.35, 1.6)
+        elif r < p.p_burst + p.p_taps + p.p_slow:
+            burst(rng.uniform(1.5, 3.0), rng.randint(3, 10))
+        elif r < p.p_burst + p.p_taps + p.p_slow + p.p_bracket:
+            names = []
+            size = rng.choice((3, 5))
+            b0 = _fit_base(base, size, 1.0)
+            for i, o in enumerate((0, -1, 1, -2, 2)[:size]):
+                exp_t = nominal_shutter(b0 + o)
+                names.append(emit(exp_t, mode=2, bias=float(o), drive="continuous", seq=i + 1))
+                t += exp_t + rng.uniform(0.05, 0.15)
+            truth.brackets.append(set(names))
+            if rng.random() < 0.5:
+                t += rng.uniform(0.3, 1.0)
+                burst(rng.choice(p.fps), burst_length())
+        elif r < p.p_burst + p.p_taps + p.p_slow + p.p_bracket + p.p_interval:
+            every = rng.uniform(1.0, 30.0) if rng.random() < 0.5 else rng.uniform(1.0, 4.0)
+            seq = set()
+            for _ in range(rng.randint(5, 15)):  # interval timer: regular, but not a burst
+                seq.add(emit(nominal_shutter(base), drive="single"))
+                t += every
+            truth.not_bursts |= seq
+            truth.timelapses.append(seq)
+        else:
+            emit(nominal_shutter(base))
+    return shots, truth
+
+
+@dataclass(slots=True)
+class ActionMetrics:
+    truth_bursts: int = 0
+    predicted_bursts: int = 0
+    exact: int = 0
+    pair_tp: int = 0
+    pair_pred: int = 0
+    pair_true: int = 0
+    merged: int = 0  # predicted bursts spanning frames of 2+ true bursts
+    split: int = 0  # true bursts spread over 2+ predicted groups
+    false_frames: int = 0  # tap / interval-timer frames placed in a burst
+    not_burst_frames: int = 0
+    bracket_frames_in_bursts: int = 0
+    bracket_frames: int = 0
+    brackets_exact: int = 0
+    brackets: int = 0
+    timelapses_exact: int = 0
+    timelapses: int = 0
+
+    def add(self, o: "ActionMetrics") -> None:
+        for f in self.__dataclass_fields__:
+            setattr(self, f, getattr(self, f) + getattr(o, f))
+
+    @property
+    def precision(self) -> float:
+        return self.exact / self.predicted_bursts if self.predicted_bursts else 1.0
+
+    @property
+    def recall(self) -> float:
+        return self.exact / self.truth_bursts if self.truth_bursts else 1.0
+
+    @property
+    def pair_f1(self) -> float:
+        p = self.pair_tp / self.pair_pred if self.pair_pred else 1.0
+        r = self.pair_tp / self.pair_true if self.pair_true else 1.0
+        return 2 * p * r / (p + r) if p + r else 0.0
+
+
+def evaluate_action(groups: list[Group], truth: ActionTruth) -> ActionMetrics:
+    def pairs(sets):
+        out = set()
+        for g in sets:
+            items = sorted(g)
+            out.update((a, b) for i, a in enumerate(items) for b in items[i + 1 :])
+        return out
+
+    pred = [frozenset(s.name for s in g.shots) for g in groups if g.kind == "burst"]
+    true = [frozenset(b) for b in truth.bursts]
+    owner = {n: i for i, b in enumerate(true) for n in b}
+    group_of = {s.name: gi for gi, g in enumerate(groups) for s in g.shots}
+    pp, tp = pairs(pred), pairs(true)
+    m = ActionMetrics(
+        truth_bursts=len(true), predicted_bursts=len(pred), exact=len(set(pred) & set(true)),
+        pair_tp=len(pp & tp), pair_pred=len(pp), pair_true=len(tp),
+        merged=sum(len({owner[n] for n in p if n in owner}) > 1 for p in pred),
+        split=sum(len({group_of[n] for n in b}) > 1 for b in true),
+        not_burst_frames=len(truth.not_bursts),
+    )
+    in_burst = {n for p in pred for n in p}
+    m.false_frames = len(truth.not_bursts & in_burst)
+    bracket_names = set().union(*truth.brackets) if truth.brackets else set()
+    m.bracket_frames = len(bracket_names)
+    m.bracket_frames_in_bursts = len(bracket_names & in_burst)
+    pred_brackets = {frozenset(s.name for s in g.shots) for g in groups if g.kind == "exposure"}
+    m.brackets = len(truth.brackets)
+    m.brackets_exact = sum(frozenset(b) in pred_brackets for b in truth.brackets)
+    pred_tl = {frozenset(s.name for s in g.shots) for g in groups if g.kind == "timelapse"}
+    m.timelapses = len(truth.timelapses)
+    m.timelapses_exact = sum(frozenset(t) in pred_tl for t in truth.timelapses)
+    return m
