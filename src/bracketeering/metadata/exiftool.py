@@ -24,12 +24,12 @@ from .native import _parse_time
 TAGS = [
     "-Make", "-Model", "-SerialNumber", "-InternalSerialNumber", "-LensModel", "-LensID",
     "-DateTimeOriginal", "-SubSecTimeOriginal", "-OffsetTimeOriginal",
-    "-ExposureTime#", "-FNumber#", "-ISO#", "-ExposureCompensation#",
+    "-Error", "-ExposureTime#", "-FNumber#", "-ISO#", "-ExposureCompensation#",
     "-EXIF:ExposureMode#", "-ExposureProgram#", "-FocalLength#", "-EXIF:WhiteBalance#",
     "-Flash#", "-FocusDistance#", "-SubjectDistance#", "-ApproximateFocusDistance#",
     "-*Bracket*", "-SequenceNumber", "-*ShotNumber*", "-DriveMode", "-ReleaseMode*",
     "-ShootingMode", "-FocusShift*", "-ContinuousDrive", "-BurstMode", "-ExposureBracketValue#", "-BracketProgram",
-    "-ShutterCount", "-ImageCount",
+    "-ShutterCount", "-ImageCount", "-FocusMode", "-IntervalShooting",
 ]
 
 _MODE_KEYS = {"drivemode", "releasemode", "releasemode2", "releasemode3", "shootingmode", "bracketsettings"}
@@ -223,6 +223,8 @@ def meta_from_record(rec: dict) -> FileMeta:
     )
     kind, pos = classify_bracket(rec)
     drive, seq = classify_drive(rec)
+    if kind != "exposure" and _focus_shift(rec):
+        kind = "focus"  # Nikon focus-shift shooting (FocusMode "Fshift"), Canon/Sony focus bracketing
     flash = _f(rec.get("Flash"))
     dist = None
     for k in ("FocusDistance", "ApproximateFocusDistance", "SubjectDistance"):
@@ -258,7 +260,35 @@ def meta_from_record(rec: dict) -> FileMeta:
         shutter_count=_shutter_count(rec),
         utc_offset=_offset_seconds(rec.get("OffsetTimeOriginal")),
         reader="exiftool",
+        error=_record_error(rec),
+        interval_shooting=_on_off(rec.get("IntervalShooting")),
     )
+
+
+def _focus_shift(rec: dict) -> bool:
+    if "shift" in str(rec.get("FocusMode", "")).lower():
+        return True
+    v = str(rec.get("FocusShiftShooting", "")).lower()
+    return bool(v) and not v.startswith("off")
+
+
+def _on_off(v) -> bool | None:
+    t = str(v).strip().lower() if v is not None else ""
+    if t.startswith("on"):
+        return True
+    if t.startswith("off"):
+        return False
+    return None
+
+
+def _record_error(rec: dict) -> str | None:
+    """exiftool's own verdict that a file isn't a usable image (e.g. "Entire file is binary zeros")."""
+    err = rec.get("Error")
+    if err:
+        return str(err)
+    if not any(rec.get(k) for k in ("Make", "Model", "DateTimeOriginal", "ExposureTime")):
+        return "no image metadata (empty, truncated or not an image file?)"
+    return None
 
 
 def _shutter_count(rec: dict) -> int | None:

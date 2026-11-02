@@ -103,15 +103,15 @@ def test_burst_without_subsecond_timestamps():
     assert names(detect(r.shots), "burst") == [b]
 
 
-def test_subject_change_splits_with_pixels():
+def test_subject_change_inside_one_hold_stays_one_burst():
+    """Real review: a person moving from close-up to arm's length in one 20-frame hold (_DSC0854-0873)."""
     from bracketeering.pixels import PixelStats
     r = Roll()
-    b1 = drive(r, 6, 0.1)
-    b2 = drive(r, 6, 0.1)
+    b = drive(r, 6, 0.12) + drive(r, 6, 0.12)
     for i, s in enumerate(r.shots):
         h = 0x0F0F0F0F0F0F0F0F if i < 6 else 0xF0F0F0F0F0F0F0F0  # previews: 64 bits apart
         s.pixels = PixelStats(h, 0.0, 0.0, 0.4, "ok")
-    assert names(detect(r.shots), "burst") == [b1, b2]
+    assert names(detect(r.shots), "burst") == [b]
 
 
 def test_bracket_inside_a_burst_session_stays_a_bracket():

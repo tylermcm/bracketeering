@@ -341,10 +341,7 @@ def generate_action(profile: ActionProfile, n_events: int = 200, seed: int = 0) 
         pan_at = rng.randrange(2, n - 1) if profile.hashes and n >= 5 and rng.random() < profile.p_pan else -1
         zoom_at = rng.randrange(1, n) if n >= 3 and rng.random() < profile.p_zoom else -1
         for i in range(n):
-            if i == pan_at:  # swing to a new subject mid-burst: for culling these are different moments
-                if len(current) >= 2:
-                    truth.bursts.append(set(current))
-                current = []
+            if i == pan_at:  # swing to a new subject mid-burst: still one press, so still one burst
                 subject = rng.getrandbits(64)
             if i == zoom_at:
                 focal = round(focal * rng.choice([0.8, 1.25]), 1)

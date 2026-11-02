@@ -58,6 +58,7 @@ class FileMeta:
     bracket_program: int | None = None  # frames per bracket cycle the camera was set to (Nikon BracketProgram)
     drive_mode: str | None = None  # "continuous" or "single" (maker notes)
     shutter_count: int | None = None  # body's actuation counter (maker notes): identifies a capture
+    interval_shooting: bool | None = None  # camera's interval timer was on (maker notes)
     utc_offset: float | None = None  # seconds east of UTC that the camera's local time was in
     sequence_number: int | None = None  # frame index within a continuous-drive burst (maker notes)
     file_number: int | None = None
@@ -179,7 +180,14 @@ class Shot:
 
 
 def frame_step(a: Shot, b: Shot) -> int | None:
-    """Frame-counter difference b - a, handling the 9999 -> 0001 wrap."""
+    """How many captures apart b is from a: shutter count when both have one, else file number.
+
+    The body's shutter count is continuous; file numbers restart (new folder, focus-shift
+    sequences, 9999 -> 0001) or switch series (_DSC8xxx / _DSC0xxx), which mustn't break a burst.
+    """
+    ca, cb = a.meta.shutter_count, b.meta.shutter_count
+    if ca is not None and cb is not None and a.camera_key == b.camera_key:
+        return cb - ca
     fa, fb = a.meta.file_number, b.meta.file_number
     if fa is None or fb is None:
         return None

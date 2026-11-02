@@ -129,7 +129,8 @@ class _CameraContext:
 # --------------------------------------------------------------------------- utils
 
 def _order_key(s: Shot):
-    return (s.time if s.time is not None else math.inf, s.meta.file_number or 0, s.name)
+    # within one second (coarse timestamps) the shutter count, then the file number, gives the order
+    return (s.time if s.time is not None else math.inf, s.meta.shutter_count or 0, s.meta.file_number or 0, s.name)
 
 
 def _gap(a: Shot, b: Shot) -> float | None:

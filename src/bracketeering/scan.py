@@ -69,38 +69,55 @@ def pair_sidecars(metas: list[FileMeta]) -> list[Shot]:
     return merge_copies(shots)
 
 
-def _identity(s: Shot) -> tuple | None:
-    """A key that only two files of the *same capture* share."""
+def _identities(s: Shot) -> list[tuple]:
+    """Keys that only files of the *same capture* share.
+
+    Copies keep the body's shutter count; edited exports (other folder, name suffix or format)
+    usually lose the maker notes but keep the capture time, frame number and exposure.
+    """
     m = s.meta
     cam = s.camera_key
     if not any(cam):
-        return None
+        return []
+    keys: list[tuple] = []
     if m.shutter_count is not None:
-        return (cam, "count", m.shutter_count)
-    if m.capture_time is not None and m.time_precise and m.file_number is not None:
-        return (cam, "time", round(m.capture_time, 3), m.file_number, m.exposure_time, m.f_number, m.iso)
-    return None
+        keys.append((cam, "count", m.shutter_count))
+    if m.capture_time is not None and m.file_number is not None:
+        t = round(m.capture_time, 2) if m.time_precise else int(m.capture_time)
+        keys.append((cam, "time", t, m.file_number, m.exposure_time, m.f_number, m.iso))
+        if m.time_precise:  # an export without sub-seconds still matches its source's whole second
+            keys.append((cam, "time", int(m.capture_time), m.file_number, m.exposure_time, m.f_number, m.iso))
+    return keys
 
 
 def merge_copies(shots: list[Shot]) -> list[Shot]:
-    """Merge copies of one capture found in different folders (e.g. a "_picks" folder) into one shot.
+    """Merge copies and edited exports of one capture (e.g. a "_picks" or "Edits" folder) into one shot.
 
-    Without this, a copy and its original look like two frames 0 s apart: a fake burst. The file
-    in the shallowest folder becomes the primary; the copies stay listed under the same shot.
+    Without this, a copy and its original look like two frames 0 s apart: a fake burst. Shots sharing
+    any identity key are merged; the RAW in the shallowest folder becomes the primary file.
     """
-    by_key: dict[tuple, list[Shot]] = defaultdict(list)
+    parent = list(range(len(shots)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    first_with: dict[tuple, int] = {}
+    for i, s in enumerate(shots):
+        for key in _identities(s):
+            j = first_with.setdefault(key, i)
+            if j != i:
+                parent[find(i)] = find(j)
+    members: dict[int, list[Shot]] = defaultdict(list)
+    for i, s in enumerate(shots):
+        members[find(i)].append(s)
     out: list[Shot] = []
-    for s in shots:
-        key = _identity(s)
-        if key is None:
-            out.append(s)
-        else:
-            by_key[key].append(s)
-    for same in by_key.values():
+    for same in members.values():
         if len(same) == 1:
             out.append(same[0])
             continue
         same.sort(key=lambda s: (len(s.meta.path.parts), str(s.meta.path)))
-        files = [f for s in same for f in s.files]
-        out.append(Shot(files))  # primary: the RAW in the shallowest folder (see Shot.__post_init__)
+        out.append(Shot([f for s in same for f in s.files]))  # primary: see Shot.__post_init__
     return out

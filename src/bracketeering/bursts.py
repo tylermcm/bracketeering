@@ -76,8 +76,12 @@ class BurstModel:
     ev_jump_threshold: float = 1.5  # EV
     frame_skip: float = 0.3  # per missing frame number (penalty)
     hash_same: float = 0.3  # previews look alike (pixels)
-    hash_change: float = 8.0  # previews look different (pixels, penalty)
+    hash_change: float = 1.0  # previews don't register (pixels, penalty): weak, since panning with a
+    # moving subject or a fast-changing scene also fails to register; one hold stays one burst
     hash_same_max: int = 12
+    refocus: float = 1.5  # focus distance jumped between frames at a slow pace (penalty)
+    refocus_ratio: float = 1.4
+    slow_pace: float = 0.5  # s: intervals at least this long count as a slow pace
     hash_change_min: int = 24
     # whole-second timestamps: P(break interval = 0, 1, >=2 s)
     break_seconds: tuple[float, float, float] = (0.2, 0.45, 0.35)
@@ -219,6 +223,14 @@ def _pairs(chain: list[Shot], cfg: BurstConfig) -> list[_Pair]:
         if fs is not None and fs > 1:
             meta -= m.frame_skip * (fs - 1)
             cand = True
+        da, db = ma.focus_distance, mb.focus_distance
+        if iv is not None and iv >= m.slow_pace and da and db and max(da, db) / min(da, db) >= m.refocus_ratio:
+            # At a slow pace, focus jumping between frames (199 m -> 100 m -> 67 m) means the
+            # shooter half-pressed and pressed again; a held drive tracks a subject smoothly.
+            meta -= m.refocus
+            cand = True
+        if iv is not None and ma.time_precise and mb.time_precise and abs(iv) < 0.002:
+            hard = cand = True  # identical capture times: duplicates or exports, never a 500 fps burst
         sa, sb = ma.sequence_number, mb.sequence_number
         if sa is not None and sb is not None:
             if sb == sa + 1:
@@ -272,9 +284,6 @@ def _pairs(chain: list[Shot], cfg: BurstConfig) -> list[_Pair]:
 def _break(p: _Pair, m: BurstModel) -> float:
     """Log likelihood of interval p as a break between separate presses (or subjects)."""
     if p.interval is None:
-        return 0.0
-    if p.subject_change:
-        # The camera swung to a new subject: a boundary at drive speed, not a human pause.
         return 0.0
     if p.precise:
         # The pause a person needs runs from the end of the exposure: 0.4 s exposures fired
@@ -505,8 +514,8 @@ class TimelapseConfig:
     min_frames: int = 5
     min_interval: float = 1.0  # s; faster regular sequences are drive bursts
     max_interval: float = 3600.0
-    tolerance: float = 0.01  # timers are precise: max deviation as a fraction of the interval...
-    tolerance_abs: float = 0.04  # ...plus this many seconds of timestamp rounding
+    tolerance: float = 0.004  # timers are precise: max deviation as a fraction of the interval...
+    tolerance_abs: float = 0.02  # ...plus this many seconds of timestamp rounding (1/100 s stamps)
 
 
 def _regular(a: Shot, b: Shot, interval: float, cfg: TimelapseConfig) -> bool:
@@ -555,7 +564,10 @@ def form_timelapses(groups: list[Group], cfg: TimelapseConfig) -> list[Group]:
         prev = groups[i - 1].shots[-1] if i > 0 else None
         heels = (prev is not None and prev.time is not None and frame_step(prev, a) in (1, None)
                  and a.time - prev.time < min(0.8 * interval, 1.1))
-        if heels or not _regular(a, b, interval, cfg) or j - i + 1 < cfg.min_frames:
+        # The camera recorded that its interval timer was off (or these are focus-shift frames).
+        timer_off = any(groups[k].shots[0].meta.interval_shooting is False or groups[k].shots[0].meta.bracket_kind == "focus"
+                        for k in range(i, j + 1))
+        if heels or timer_off or not _regular(a, b, interval, cfg) or j - i + 1 < cfg.min_frames:
             out.append(g)
             i += 1
             continue

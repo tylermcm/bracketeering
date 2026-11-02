@@ -33,8 +33,8 @@ def read_many(paths: list[Path], backend: str = "auto", workers: int | None = No
         failed = [i for i, m in enumerate(metas) if m.error or m.exposure_time is None]
         if failed:
             for i, m in zip(failed, exiftool.read_exiftool([paths[i] for i in failed])):
-                if not m.error:
-                    metas[i] = m
+                if not m.error or metas[i].error:
+                    metas[i] = m  # exiftool's reading, or its (more specific) error
     return metas
 
 

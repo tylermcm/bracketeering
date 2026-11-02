@@ -34,6 +34,7 @@ T_BODY_SERIAL, T_LENS_MODEL = 0xA431, 0xA434
 T_MAKERNOTE = 0x927C
 # Nikon type-3 maker note tags (same ids as exiftool's Nikon::Main table)
 N_EXPOSURE_BRACKET_VALUE, N_SHOOTING_MODE, N_SHUTTER_COUNT, N_SERIAL = 0x0019, 0x0089, 0x00A7, 0x001D
+N_FOCUS_MODE = 0x0007  # "AF-S", "AF-C", "MF", ... or "Fshift" during focus-shift shooting
 N_MODE_CONTINUOUS, N_MODE_EXPOSURE_BRACKETING = 1 << 0, 1 << 4
 
 _TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8, 13: 4}
@@ -229,7 +230,8 @@ def _nikon_makernote(f: BinaryIO, start: int) -> dict:
         raise ValueError("not a Nikon type-3 maker note")
     t = _Tiff(f, start + 10)  # offsets inside the note are relative to its own TIFF header
     tags = t.ifd(t.ifd0)
-    return {k: tags[k] for k in (N_EXPOSURE_BRACKET_VALUE, N_SHOOTING_MODE, N_SHUTTER_COUNT, N_SERIAL) if k in tags}
+    keep = (N_EXPOSURE_BRACKET_VALUE, N_SHOOTING_MODE, N_SHUTTER_COUNT, N_SERIAL, N_FOCUS_MODE)
+    return {k: tags[k] for k in keep if k in tags}
 
 
 def read_tags(path: Path) -> tuple[dict, dict]:
@@ -253,6 +255,8 @@ def read_tags(path: Path) -> tuple[dict, dict]:
             return _tiff_tags(io.BytesIO(payload))
         if head[4:8] == b"ftyp" and head[8:12] == b"crx ":
             return _cr3_tags(f)
+        if not head.strip(b"\x00"):
+            raise ValueError("file starts with binary zeros (empty or corrupt)")
         raise ValueError("unsupported container")
 
 
@@ -320,6 +324,9 @@ def meta_from_tags(path: Path, ifd0: dict, exif: dict) -> FileMeta:
         if bracket_kind == "exposure":
             v = _num(nikon.get(N_EXPOSURE_BRACKET_VALUE))
             slot = v if v is not None and abs(v) <= 10 else None
+    focus_mode = nikon.get(N_FOCUS_MODE)
+    if isinstance(focus_mode, str) and "shift" in focus_mode.lower() and bracket_kind != "exposure":
+        bracket_kind = "focus"
     sc = nikon.get(N_SHUTTER_COUNT)
     if isinstance(sc, int) and sc > 0:
         shutter_count = sc

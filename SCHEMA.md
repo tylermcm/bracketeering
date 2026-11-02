@@ -11,7 +11,7 @@
 | `summary` | object | counts: `shots`, `files`, `exposure_brackets`, `focus_stacks`, `bursts`, `timelapses`, `singles`, `near_duplicate_scenes`, `unreadable` |
 | `groups` | array | every shot belongs to exactly one group, singles included, in capture order |
 | `files` | object | per-file index keyed by path; **every input file appears exactly once** |
-| `errors` | array | `{file, error}` for files whose metadata could not be read (they still appear in `files`, as singles) |
+| `errors` | array | `{file, error}` for files that couldn't be read, e.g. zero-filled or truncated files (they still appear in `files`, as singles) |
 
 ## `groups[]`
 
@@ -42,7 +42,7 @@
 | `kind` | string | that group's kind |
 | `role` | `"representative"` \| `"member"` \| `"single"` | the file's role in its group |
 | `position` | int | 1-based capture position within the group |
-| `primary` | bool | false for a sidecar (e.g. the JPEG half of a RAW+JPEG pair) and for copies of the same capture in other folders (e.g. a `_picks/` folder); they share their shot's role |
+| `primary` | bool | false for a sidecar (e.g. the JPEG half of a RAW+JPEG pair) and for copies or edited exports of the same capture in other folders or formats (e.g. `_picks/`, `Edits/`); they share their shot's role |
 | `scene` | int \| null | near-duplicate scene id (with `--pixels`) |
 | `best_exposed` | bool \| null | exposure brackets with `--pixels` |
 | `error` | string \| null | metadata read error, if any |

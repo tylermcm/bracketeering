@@ -43,7 +43,10 @@ class PixelConfig:
     scene_lookback: int = 4  # compare with this many recent groups, not just the previous one
     hash_threshold: int = 12  # dHash fallback only: bits (of 64) that map to scene_similarity
     scene_similarity: float = 0.5  # preview similarity (-1..1) at or above which groups are one scene (= SAME_SCENE)
-    anchor_similarity: float = 0.35  # ...and never links a group clearly unlike the scene's first one (= DIFFERENT)
+    anchor_similarity: float = 0.2  # ...and never links a group clearly unlike the scene's first one
+    weak_similarity: float = 0.15  # structure this weak still links if the layout matches strongly...
+    layout_similarity: float = 0.85  # ...at least this much...
+    layout_window: float = 20.0  # ...and the frames are this close in time (s); also the featureless fallback
 
 
 @dataclass(slots=True, frozen=True)
@@ -53,7 +56,8 @@ class PixelStats:
     shadows: float  # fraction of pixels with crushed luma
     mean: float  # mean luma, 0..1
     flag: str  # "ok", "over", "under"
-    thumb: bytes | None = None  # THUMB_W x THUMB_H grayscale, for shift-tolerant similarity
+    thumb: bytes | None = None  # THUMB_W x THUMB_H band-passed: structure, for registration
+    layout: bytes | None = None  # LAYOUT_W x LAYOUT_H plain grayscale: overall tonal layout
 
     def to_dict(self) -> dict:
         return {"highlights_clipped": round(self.highlights, 4), "shadows_crushed": round(self.shadows, 4),
@@ -137,12 +141,48 @@ def thumb_similarity(a: bytes, b: bytes) -> float:
     return fine
 
 
+MIN_DETAIL = 4.0  # std of the band-passed thumbnail (0-255): below this a frame is featureless
+
+
+@lru_cache(maxsize=8192)
+def detail(thumb: bytes) -> float:
+    """How much structure a band-passed thumbnail holds (moon in an empty sky, a black misfire: ~0-3)."""
+    n = len(thumb)
+    mean = sum(thumb) / n
+    return math.sqrt(sum((v - mean) ** 2 for v in thumb) / n)
+
+
 def similarity(a, b) -> float | None:
-    """Similarity of two shots' previews, or None when either wasn't analysed."""
+    """Do two shots' previews register? -1..1, or None when unknown.
+
+    Unknown when either wasn't analysed or is featureless: a moon in an empty sky or a black
+    misfire has nothing to register, which says nothing about whether the shot changed.
+    """
     ta, tb = getattr(a.pixels, "thumb", None), getattr(b.pixels, "thumb", None)
-    if ta is None or tb is None:
+    if ta is None or tb is None or detail(ta) < MIN_DETAIL or detail(tb) < MIN_DETAIL:
         return None
     return thumb_similarity(ta, tb)
+
+
+LAYOUT_W, LAYOUT_H = 28, 20
+_LS = 2  # layout shift search, pixels each way (+-8 %)
+
+
+def layout_similarity(a, b) -> float | None:
+    """Correlation of the overall tonal layout (sky/ground/subject placement), -1..1, or None.
+
+    Tolerant of handheld drift on fine texture where structure registration fails (ivy, foliage),
+    but too tolerant on its own (a recompose of the same place keeps its layout), so it only ever
+    supports a structural match, never replaces one.
+    """
+    la, lb = getattr(a.pixels, "layout", None), getattr(b.pixels, "layout", None)
+    if la is None or lb is None or len(la) != len(lb):
+        return None
+    best = -1.0
+    for dy in range(-_LS, _LS + 1):
+        for dx in range(-_LS, _LS + 1):
+            best = max(best, _ncc(la, lb, LAYOUT_W, _LS, _LS, dx, dy))
+    return best
 
 
 def available() -> bool:
@@ -193,7 +233,8 @@ def analyse_file(path: Path, cfg: PixelConfig = PixelConfig()) -> PixelStats | N
     else:
         flag = "ok"
     thumb = band_pass(gray)
-    return PixelStats(_dhash(gray), highlights, shadows, mean, flag, thumb)
+    layout = gray.resize((LAYOUT_W, LAYOUT_H), Image.Resampling.BOX).tobytes()
+    return PixelStats(_dhash(gray), highlights, shadows, mean, flag, thumb, layout)
 
 
 def _hamming(a: int, b: int) -> int:
@@ -236,16 +277,40 @@ def pick_best_exposed(g: Group, cfg: PixelConfig = PixelConfig()) -> int | None:
 
 
 def _looks_alike(a: Group, b: Group, cfg: PixelConfig) -> float | None:
-    """Similarity of two groups' representatives in 0..1-ish (None when unknown)."""
+    """Similarity of two groups' representatives (structure first), or None when unknown."""
     sa, sb = a.shots[a.representative], b.shots[b.representative]
     sim = similarity(sa, sb)
     if sim is not None:
         return sim
     pa, pb = sa.pixels, sb.pixels
-    if pa is None or pb is None:
-        return None
-    # dHash fallback (e.g. stats computed elsewhere without a thumbnail): map bit distance to a score
+    if pa is None or pb is None or getattr(pa, "thumb", None) is not None:
+        return None  # analysed but featureless: unknown
+    # dHash fallback (stats computed elsewhere without a thumbnail): map bit distance to a score
     return 1.0 - _hamming(pa.dhash, pb.dhash) / (cfg.hash_threshold * 2.5)  # type: ignore[attr-defined]
+
+
+def _same_scene(prev: Group, g: Group, cfg: PixelConfig) -> tuple[bool, float]:
+    """(link?, strength) for two groups shot within the scene window."""
+    sim = _looks_alike(prev, g, cfg)
+    sa, sb = prev.shots[prev.representative], g.shots[g.representative]
+    gap = (g.shots[0].time - prev.shots[-1].time) if g.shots[0].time is not None and prev.shots[-1].time is not None else None
+    if sim is not None:
+        if sim >= cfg.scene_similarity:
+            return True, sim
+        # Handheld drift on fine texture (ivy, foliage) defeats structure registration; a strong
+        # layout match a few seconds later still means the same view.
+        lay = layout_similarity(sa, sb)
+        if sim >= cfg.weak_similarity and lay is not None and lay >= cfg.layout_similarity and gap is not None and gap <= cfg.layout_window:
+            return True, sim
+        return False, sim
+    # Featureless frames (moon, black sky): fall back to camera settings and timing.
+    ma, mb = sa.meta, sb.meta
+    same_lens = (ma.focal_length is None or mb.focal_length is None
+                 or abs(ma.focal_length - mb.focal_length) <= 0.05 * max(ma.focal_length, mb.focal_length))
+    close_ev = sa.ev is None or sb.ev is None or abs(sa.ev - sb.ev) <= 1.5
+    if gap is not None and gap <= cfg.layout_window and same_lens and close_ev:
+        return True, 0.0
+    return False, -1.0
 
 
 def assign_scenes(groups: list[Group], cfg: PixelConfig = PixelConfig()) -> None:
@@ -258,24 +323,27 @@ def assign_scenes(groups: list[Group], cfg: PixelConfig = PixelConfig()) -> None
     recent: dict[tuple, list[Group]] = {}
     anchors: dict[int, Group] = {}  # scene id -> its first group
     next_id = 1
-    threshold = cfg.scene_similarity
     for g in sorted(groups, key=lambda g: (g.shots[0].time is None, g.shots[0].time or 0.0, g.shots[0].name)):
         cam = g.shots[0].camera_key
         window = recent.setdefault(cam, [])
         t_now = g.shots[0].time
-        best, best_sim = None, threshold
+        best, best_sim = None, -2.0
         for prev in reversed(window[-cfg.scene_lookback :]):
             t_prev = prev.shots[-1].time
             if t_prev is None or t_now is None or t_now - t_prev > cfg.scene_window:
                 continue
-            sim = _looks_alike(prev, g, cfg)
-            if sim is not None and sim >= best_sim:
-                best, best_sim = prev, sim
+            link, strength = _same_scene(prev, g, cfg)
+            if link and strength > best_sim:
+                best, best_sim = prev, strength
         if best is not None:
             # Guard against chaining: A~B, B~C, C~D can walk across subjects over many minutes.
-            anchor_sim = _looks_alike(anchors[best.scene], g, cfg) if best.scene in anchors else None  # type: ignore[index]
-            if anchor_sim is not None and anchor_sim < cfg.anchor_similarity:
-                best = None
+            # Only a *clear* mismatch with the scene's first group (structure and layout) breaks it.
+            anchor = anchors.get(best.scene)  # type: ignore[arg-type]
+            if anchor is not None and anchor is not best:
+                a_sim = _looks_alike(anchor, g, cfg)
+                a_lay = layout_similarity(anchor.shots[anchor.representative], g.shots[g.representative])
+                if a_sim is not None and a_sim < cfg.anchor_similarity and (a_lay is None or a_lay < cfg.layout_similarity):
+                    best = None
         if best is not None:
             g.scene = best.scene
         else:
