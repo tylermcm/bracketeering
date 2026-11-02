@@ -33,6 +33,15 @@ pip install -e '.[pixels]'  # + Pillow, for --pixels
 pip install -e '.[dev]'     # + pytest, pillow for the test-suite
 ```
 
+If pip says the build backend is **missing the `build_editable` hook**, the build is using setuptools older than 64. That happens with `--no-build-isolation`, with conda, or when pip is configured that way. Upgrade the build tools in the same environment and retry:
+
+```bash
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -e .
+```
+
+You can also skip installing entirely, since there are no required dependencies: `PYTHONPATH=src python -m bracketeering scan PATH`.
+
 ## Usage
 
 ```bash
