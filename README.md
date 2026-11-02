@@ -66,7 +66,8 @@ Useful options:
 - `--manual-gap`: for hand-adjusted brackets in M mode (default 6)
 - `--burst-gap`: seconds between burst frames (default 1)
 - `--min-confidence`: weaker bracket candidates become singles (default 0.5)
-- `--scene-window`, `--hash-threshold`: near-duplicate tuning
+- `--exclude PATTERN`: skip subfolders by name, e.g. `--exclude _winners` (repeatable)
+- `--scene-window`, `--scene-similarity`: near-duplicate tuning
 - `--max-size`, `--min-size`, `--no-focus`, `--no-bursts`, `--no-timelapse`
 
 `organize` creates one folder per group, for example `20240501-120000_IMG_0412_HDR5x1EV/` or `…_BURST9/`. It keeps RAW+JPEG sidecars together and never overwrites existing files.
@@ -92,19 +93,24 @@ from bracketeering.report import to_dict    # the SCHEMA.md structure, ready for
 
 ## How it works
 
-1. **Read metadata.** The engine reads capture time with sub-seconds and UTC offset, shutter, aperture, ISO, exposure compensation, EXIF `ExposureMode` (2 = auto bracket), focal length, lens, body serial, white balance, flash and subject distance. With `--backend exiftool` it also reads maker-note bracket tags (Canon `BracketMode`/`BracketShotNumber`/`AEBBracketValue`, Sony `ReleaseMode*`, Nikon `ShootingMode`, Fujifilm/Pentax `AutoBracketing`, Olympus `DriveMode`, Panasonic `BracketSettings`, …) and normalises them to a bracket kind and shot position.
-2. **Pair sidecars.** `IMG_1.CR3` and `IMG_1.JPG` in the same folder become one shot when their timestamps agree. The RAW is the authoritative source.
-3. **Split into runs** per camera body. A run is a chain of consecutive frames with the same lens and focal length and comparable exposure data. Each frame must start within `max_gap` of the *end* of the previous exposure, so long-exposure brackets work. Large frame-counter jumps also end a run.
-4. **Carve out focus stacks.** These are constant-exposure blocks flagged by maker notes, or with monotonic focus distance.
-5. **Segment each run by dynamic programming.** Each candidate group gets an additive log-odds-style score, and singles score zero. The engine finds the partition with the highest total score:
+1. **Read metadata.** The engine reads capture time with sub-seconds and UTC offset, shutter, aperture, ISO, exposure compensation, EXIF `ExposureMode` (2 = auto bracket), focal length, lens, body serial, white balance, flash and subject distance. With `--backend exiftool` it also reads maker-note bracket tags (Canon `BracketMode`/`BracketShotNumber`/`AEBBracketValue`, Sony `ReleaseMode*`, Nikon `ShootingMode`, Fujifilm/Pentax `AutoBracketing`, Olympus `DriveMode`, Panasonic `BracketSettings`, …) and normalises them to a bracket kind and shot position. The native reader also decodes **Nikon maker notes** directly: `ShootingMode` (bracketing on/off, continuous drive), `ExposureBracketValue` (this frame's slot in the bracket program) and `ShutterCount`. Configuration tags that Nikon writes on every frame (`BracketSet`, `AutoBracketModeM`) are ignored, because they don't say whether *this* frame was bracketed.
+2. **Pair sidecars and merge copies.** `IMG_1.CR3` and `IMG_1.JPG` in the same folder become one shot when their timestamps agree. The RAW is the authoritative source. Copies of the same capture in other folders (same body and shutter count, or the same sub-second timestamp and frame number), such as a `_picks/` folder, are merged into that shot too. Otherwise a copy and its original look like a 0-second burst.
+3. **Camera bracket cycles** (`cycles.py`). When the camera recorded each frame's bracket slot, brackets are rebuilt from those slots rather than inferred from measured exposure. With Auto ISO the camera re-meters on every press, so a 0 / −4/3 / −2/3 cycle can *measure* +0.85 / −0.64 / 0.
+   - **New cycle:** slots follow the program order (metered slot first by default). A repeated or earlier slot starts a new cycle: a re-press restart, or the tail of a cycle whose first frames were deleted.
+   - **Recompose split:** a cycle splits where the shooter recomposed, either a pause over 3 s or (with `--pixels`) clearly different previews. Re-presses of a second or two on one composition stay together.
+   - **Offsets:** they're the camera's own (`[0, -1.33, -0.67]`), the representative is the metered frame, and partial cycles are flagged ("partial bracket: 3 of 5 slots").
+   - **Bracketing off:** frames the camera recorded with bracketing *off* can never be grouped as a bracket.
+4. **Split into runs** per camera body, for frames without bracket slots. A run is a chain of consecutive frames with the same lens and focal length and comparable exposure data. Each frame must start within `max_gap` of the *end* of the previous exposure, so long-exposure brackets work. Large frame-counter jumps also end a run.
+5. **Carve out focus stacks.** These are constant-exposure blocks flagged by maker notes, or with monotonic focus distance.
+6. **Segment each run by dynamic programming.** Each candidate group gets an additive log-odds-style score, and singles score zero. The engine finds the partition with the highest total score:
    - **Exposure structure.** Brightness is measured from all three settings: log2(shutter) + log2(ISO/100) − 2·log2(f-number). That makes shutter-driven brackets (A/Av and M modes), aperture-driven brackets (S/Tv mode) and auto-ISO brackets all register. Cameras write rounded labels (f/13 is really f/12.7, 1/125 s is really 1/128 s), so standard ⅓-stop labels are snapped back to their exact values first. Exposures must be distinct and evenly spaced. The step is fitted on the 1/3- and 1/2-stop grid and tolerates nominal shutter-speed rounding. An interior gap of exactly *k* steps means *k*−1 frames were deleted. The group is still accepted, with a warning.
    - **Firing order.** Groups that match the orders cameras actually use score higher: `0,-,+`, `-,0,+`, `+,0,-`, `0,+,-`, `0,-,--,+,++`, … The engine also matches partial brackets with a missing frame at either end.
    - **Metadata.** Evidence includes `ExposureMode = auto bracket`, maker-note bracket mode, shot positions `1..n` (a reset to 1 inside a group is a hard veto), and exposure compensation matching the measured deltas. A frame flagged as bracketed is penalised if it's left ungrouped. If a body is seen writing `ExposureMode=2` elsewhere in the shoot, its frames with other modes count *against* bracketing.
    - **Context.** Groups that change two exposure variables at once, change white balance or fire a flash are penalised. A large time gap favours a boundary there.
    - **Burst veto.** Auto-exposure bursts wander in 1/3-stop increments and can look like small brackets. A group without metadata support is dissolved if ungrouped frames, or groups with a different signature, sit next to it at the same cadence and exposure level.
-6. **Second pass with a prior.** Photographers rarely change bracket settings mid-shoot. The camera's dominant signature (size, firing order, step) becomes a prior, and the DP runs again. This settles the hard cases, such as back-to-back brackets fired in continuous drive with no pause. Group evaluations are cached, so the second pass costs almost nothing.
-7. **Timelapses.** Leftover frames fired at a fixed interval of ≥ 1 s (within 1% + 40 ms; ≥ 2 s for whole-second timestamps), at least 5 in a row, become a timelapse. Continuous drive is never that slow, and timers are far more precise than any drive or human. A slowing burst can't be mistaken for one, because a timelapse doesn't start right on the heels of a drive-speed frame.
-8. **Bursts** (`bursts.py`). A burst is **one press of the shutter in continuous drive**. It's detected with a probabilistic sequence model that gets the same care as brackets:
+7. **Second pass with a prior.** Photographers rarely change bracket settings mid-shoot. The camera's dominant signature (size, firing order, step) becomes a prior, and the DP runs again. This settles the hard cases, such as back-to-back brackets fired in continuous drive with no pause. Group evaluations are cached, so the second pass costs almost nothing.
+8. **Timelapses.** Leftover frames fired at a fixed interval of ≥ 1 s (within 1% + 40 ms; ≥ 2 s for whole-second timestamps), at least 5 in a row, become a timelapse. Continuous drive is never that slow, and timers are far more precise than any drive or human. A slowing burst can't be mistaken for one, because a timelapse doesn't start right on the heels of a drive-speed frame.
+9. **Bursts** (`bursts.py`). A burst is **one press of the shutter in continuous drive**. It's detected with a probabilistic sequence model that gets the same care as brackets:
    - Leftover frames are chained: same body and lens, consecutive frame numbers, ≤ 2.5 s apart. Every interval in a chain is explained as either **drive** or **break**.
      - **Drive:** the camera fired the next frame. The interval sits near the burst's local cadence, with a few % jitter and occasional autofocus/buffer slowdowns, and the cadence fits a drive rate prior (~1–60 fps).
      - **Break:** a separate press. The pause follows a log-normal (~0.9 s typical), and pauses under ~0.2 s are rare because humans can't re-press that fast.
@@ -115,11 +121,13 @@ from bracketeering.report import to_dict    # the SCHEMA.md structure, ready for
    - **Pixels** (with `--pixels`): a subject change between consecutive previews splits a burst, even at full drive speed.
    - **Coarse timestamps:** without sub-seconds, the model uses the probability of landing in the same or next second, a decaying probability for several separate presses within one second, and an edge prior (a separate press right next to a running burst is unlikely).
    - **Confidence** is the log-odds of "one press" vs "separate presses". On simulated shoots, bursts at ≥ 0.9 were exactly right 95% of the time.
-9. **Representatives.** Each group gets a representative frame. For brackets it's the middle exposure (≈ 0 EV); for bursts, timelapses and stacks it's the middle frame.
-10. **Pixels (optional).** Embedded previews are found in each container (JPEG `APP1`, TIFF/NEF/ARW/DNG/CR2 preview IFDs and SubIFDs, RW2 `JpgFromRaw`, RAF, CR3 `PRVW`). Lossless-JPEG raw data is skipped. Each preview is decoded at reduced size, and the engine computes:
+10. **Representatives.** Each group gets a representative frame. For brackets it's the middle exposure (≈ 0 EV); for bursts, timelapses and stacks it's the middle frame.
+11. **Pixels (optional).** Embedded previews are found in each container (JPEG `APP1`, TIFF/NEF/ARW/DNG/CR2 preview IFDs and SubIFDs, RW2 `JpgFromRaw`, RAF, CR3 `PRVW`). Lossless-JPEG raw data is skipped. Each preview is decoded at reduced size, and the engine computes:
    - **Exposure stats** per frame: highlight clipping (any channel ≥ 250), crushed shadows, mean level, and an `ok`/`over`/`under` flag.
    - **`best_exposed`** per bracket: the brightest frame whose highlights hold (≤ 0.5% clipped), i.e. expose to the right. Of the usable frames it has the cleanest shadows.
-   - **Near-duplicate scenes:** consecutive groups from one body, at most `scene_window` apart, whose representatives have a similar perceptual hash (dHash). Gradient-based hashing tolerates exposure differences.
+   - **Preview similarity:** small grayscale thumbnails are compared by normalised cross-correlation at the best of a few small shifts. This tolerates handheld drift up to ~8 % of the frame and is unaffected by exposure differences, so bracket frames still match. The thumbnail is blurred enough that fine texture (foliage, ivy, fog) doesn't dominate. dHash, used before, flipped 13–29 of 64 bits on such textures for the same composition.
+   - **Near-duplicate scenes:** each group's representative is compared with the last 4 groups from the same body within `scene_window`, not just the previous one, so one odd frame doesn't cut a scene in two. Groups at or above `--scene-similarity` (0.6) share a scene.
+   - **Bursts and bracket cycles** also use the similarity: below 0.35 counts as a subject change (bursts) or a recompose (bracket cycles).
 
 ## Accuracy
 
@@ -178,7 +186,8 @@ python -m pytest
 src/bracketeering/
   metadata/native.py    dependency-free EXIF reader (JPEG/TIFF/RAW/RAF/CR3)
   metadata/exiftool.py  batched exiftool backend + maker-note normalisation
-  scan.py               file discovery, RAW+JPEG pairing
+  scan.py               file discovery, RAW+JPEG pairing, merging copies across folders
+  cycles.py             brackets rebuilt from the camera's own bracket slots (maker notes)
   engine.py             bracket detection: run splitting, scoring, DP segmentation, priors
   bursts.py             burst model (drive vs break, pace changes) + timelapse detection
   preview.py            embedded JPEG preview extraction
@@ -191,13 +200,14 @@ src/bracketeering/
 
 ## Notes and limitations
 
-- Times in reports are UTC when the file records an offset (`OffsetTimeOriginal`), and camera-local otherwise.
-- The native reader doesn't decode maker notes. Bracket detection still works from EXIF and exposure analysis, but maker-note shot positions need `--backend exiftool`.
+- Times in reports are camera-local, with the UTC offset when the file records one (`OffsetTimeOriginal`).
+- The native reader decodes Nikon maker notes only. For other makes, maker-note bracket and drive tags need `--backend exiftool`; without them, detection works from EXIF and exposure analysis.
+- The similarity thresholds (0.6 same scene, 0.35 different) are first estimates. `scripts/similarity_pairs.py` prints the similarity of frame pairs, for calibrating on real shoots.
 - HEIC/HEIF and less common RAW containers fall back to exiftool when it's installed. Without exiftool, they're reported as unreadable.
 - White-balance and flash brackets are not grouped as exposure brackets. ISO brackets (auto-ISO AEB) are.
 - ⅓-stop brackets need metadata support (EXIF auto-bracket flag, maker notes or matching exposure compensation). Without it, a ⅓-stop series looks the same as metering drift in a burst, so it is never grouped as a bracket.
 - A timelapse needs at least 5 frames. Shorter interval-timer runs fall back to singles.
 - Depth-of-field series (several apertures at the *same* exposure, with the shutter compensating) aren't exposure brackets. They come out as a burst or singles.
 - Pixel exposure stats come from the camera's JPEG preview, which clips highlights earlier than the RAW does, so `over` is conservative. Treat the stats as a triage signal, not a RAW-accurate measurement.
-- Near-duplicate detection only links *consecutive* groups from the same body within `scene_window`. Returning to a subject after shooting something else starts a new scene.
+- Near-duplicate detection only links groups from the same body within `scene_window`, looking back 4 groups. Returning to a subject after shooting several other things starts a new scene.
 - HEIC files have no extractable preview without extra libraries, so `--pixels` skips them.

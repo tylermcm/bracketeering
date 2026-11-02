@@ -9,7 +9,7 @@ from __future__ import annotations
 import csv
 import io
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from . import __version__
 from .model import FileMeta, Group, Shot
@@ -18,9 +18,12 @@ SCHEMA = "bracketeering/2"
 _PREFIX = {"exposure": "B", "focus": "F", "burst": "U", "timelapse": "T", "single": "S"}
 
 
-def _fmt_time(t: float | None) -> str | None:
+def _fmt_time(t: float | None, offset: float | None = None) -> str | None:
+    """Camera-local time with its UTC offset when the file recorded one, otherwise camera-local time."""
     if t is None:
         return None
+    if offset is not None:
+        return datetime.fromtimestamp(t, tz=timezone(timedelta(seconds=offset))).isoformat(timespec="milliseconds")
     return datetime.fromtimestamp(t, tz=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "")
 
 
@@ -45,7 +48,7 @@ def _frame_dict(g: Group, pos: int, s: Shot) -> dict:
     d = {
         "files": [str(p) for p in s.paths],
         "role": frame_role(g, pos),
-        "time": _fmt_time(m.capture_time),
+        "time": _fmt_time(m.capture_time, m.utc_offset),
         "shutter": _fmt_shutter(m.exposure_time),
         "aperture": m.f_number,
         "iso": m.iso,
@@ -75,7 +78,7 @@ def to_dict(groups: list[Group], errors: list[FileMeta] | None = None) -> dict:
             "size": g.size,
             "confidence": g.confidence,
             "camera": " ".join(x for x in (m.make, m.model) if x) or None,
-            "start": _fmt_time(g.shots[0].time),
+            "start": _fmt_time(g.shots[0].time, m.utc_offset),
             "representative": str(g.shots[g.representative].meta.path),
             "best_exposed": str(g.shots[g.best_exposed].meta.path) if g.best_exposed is not None else None,
             "scene": g.scene,
@@ -138,7 +141,7 @@ def to_csv(groups: list[Group]) -> str:
                     str(p), group_id(i, g), g.kind, frame_role(g, pos), pos + 1, g.size, g.confidence,
                     g.scene if g.scene is not None else "",
                     "" if g.best_exposed is None else pos == g.best_exposed,
-                    _fmt_time(m.capture_time), _fmt_shutter(m.exposure_time), m.f_number, m.iso,
+                    _fmt_time(m.capture_time, m.utc_offset), _fmt_shutter(m.exposure_time), m.f_number, m.iso,
                     offsets[pos] if offsets else "",
                     px.flag if px else "", round(px.highlights, 4) if px else "", round(px.shadows, 4) if px else "",  # type: ignore[attr-defined]
                 ])

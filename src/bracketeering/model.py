@@ -54,7 +54,10 @@ class FileMeta:
     # Maker-note derived hints (exiftool backend only).
     bracket_kind: str | None = None  # "exposure", "focus", "flash", "wb", "iso", "none"
     bracket_position: int | None = None  # 1-based position within a bracket
+    bracket_value: float | None = None  # this frame's slot in the camera's bracket program, EV (maker notes)
     drive_mode: str | None = None  # "continuous" or "single" (maker notes)
+    shutter_count: int | None = None  # body's actuation counter (maker notes): identifies a capture
+    utc_offset: float | None = None  # seconds east of UTC that the camera's local time was in
     sequence_number: int | None = None  # frame index within a continuous-drive burst (maker notes)
     file_number: int | None = None
     reader: str | None = None
@@ -151,7 +154,7 @@ class Shot:
 
     def __post_init__(self) -> None:
         # The RAW is the most trustworthy source; otherwise the richest file.
-        self.meta = max(self.files, key=lambda f: (f.is_raw, f.completeness()))
+        self.meta = max(self.files, key=lambda f: (f.is_raw, -len(f.path.parts), f.completeness()))
         m = self.meta
         self.exposure_mask = (m.exposure_time is not None, m.f_number is not None, m.iso is not None)
         self.ev = _relative_ev(m)
@@ -204,19 +207,34 @@ class Group:
         return len(self.shots)
 
     @property
+    def slots(self) -> list[float] | None:
+        """The camera's own bracket offsets for each frame (maker notes), if every frame has one."""
+        vals = [s.meta.bracket_value for s in self.shots]
+        return None if any(v is None for v in vals) else vals  # type: ignore[return-value]
+
+    @property
     def ev_offsets(self) -> list[float]:
-        """Exposure of each frame relative to the bracket's median frame, in capture order."""
+        """Exposure of each frame in capture order, in EV.
+
+        From the camera's bracket program when known (offsets from the metered frame, immune to
+        Auto ISO re-metering), otherwise measured, relative to the group's median frame.
+        """
+        if (slots := self.slots) is not None:
+            return [round(v, 2) + 0.0 for v in slots]
         evs = [s.ev for s in self.shots]
         if any(e is None for e in evs):
             return []
         ordered = sorted(evs)  # type: ignore[arg-type]
         mid = ordered[len(ordered) // 2] if len(ordered) % 2 else (ordered[len(ordered) // 2 - 1] + ordered[len(ordered) // 2]) / 2
-        return [round(e - mid, 2) for e in evs]  # type: ignore[operator]
+        return [round(e - mid, 2) + 0.0 for e in evs]  # type: ignore[operator]
 
     @property
     def step_ev(self) -> float | None:
-        evs = sorted(s.ev for s in self.shots if s.ev is not None)
+        vals = self.slots or [s.ev for s in self.shots if s.ev is not None]
+        evs = sorted(set(round(v, 3) for v in vals))  # type: ignore[arg-type]
         if len(evs) < 2:
             return None
         diffs = sorted(b - a for a, b in zip(evs, evs[1:]))
+        if self.slots is not None:
+            return round(diffs[0], 2)  # program step: smallest gap between slots
         return round(diffs[len(diffs) // 2], 2)

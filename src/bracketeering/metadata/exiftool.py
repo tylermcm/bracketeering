@@ -28,7 +28,8 @@ TAGS = [
     "-EXIF:ExposureMode#", "-ExposureProgram#", "-FocalLength#", "-EXIF:WhiteBalance#",
     "-Flash#", "-FocusDistance#", "-SubjectDistance#", "-ApproximateFocusDistance#",
     "-*Bracket*", "-SequenceNumber", "-*ShotNumber*", "-DriveMode", "-ReleaseMode*",
-    "-ShootingMode", "-FocusShift*", "-ContinuousDrive", "-BurstMode",
+    "-ShootingMode", "-FocusShift*", "-ContinuousDrive", "-BurstMode", "-ExposureBracketValue#",
+    "-ShutterCount", "-ImageCount",
 ]
 
 _MODE_KEYS = {"drivemode", "releasemode", "releasemode2", "releasemode3", "shootingmode", "bracketsettings"}
@@ -46,6 +47,10 @@ def available() -> bool:
 
 def _kind_from_text(text: str) -> str:
     t = text.lower()
+    # Multi-part values ("Continuous, Exposure Bracketing, Auto ISO"): read only the bracketing phrase.
+    parts = [p for p in re.split(r"[,;/]", t) if "bracket" in p]
+    if parts:
+        t = parts[0]
     if "focus" in t:
         return "focus"
     if "white balance" in t or re.search(r"\bwb\b", t):
@@ -98,14 +103,30 @@ def classify_drive(record: dict) -> tuple[str | None, int | None]:
     return drive, seq
 
 
+# Tags that describe the camera's bracketing *configuration*. Nikon writes these on every frame,
+# whether or not bracketing is on, so they say nothing about the frame itself.
+_CONFIG_KEYS = {
+    "bracketset", "autobracketmodem", "autobracketset", "autobracketorder", "autobracketingset",
+    "bracketincrement", "bracketorder", "bracketsequence", "aebbracketorder", "autobracketmodeinmanual",
+}
+_SLOT_KEYS = {"exposurebracketvalue"}  # this frame's offset within the active bracket program
+
+
 def classify_bracket(record: dict) -> tuple[str | None, int | None]:
-    """Derive (bracket_kind, bracket_position) from exiftool maker-note tags."""
+    """Derive (bracket_kind, bracket_position) from exiftool maker-note tags.
+
+    Mode tags (ShootingMode, DriveMode, ReleaseMode*) are authoritative: if one of them is present
+    and doesn't mention bracketing, the frame was not bracketed, whatever configuration tags say.
+    """
     active: list[str] = []
     saw_off = False
+    mode_said_off = False
     position: int | None = None
     for key, value in record.items():
         k = key.lower()
         is_mode = k in _MODE_KEYS
+        if k in _CONFIG_KEYS or k in _SLOT_KEYS:
+            continue
         if "bracket" not in k and not is_mode and k not in _POSITION_KEYS:
             continue
         v = str(value).strip()
@@ -123,12 +144,14 @@ def classify_bracket(record: dict) -> tuple[str | None, int | None]:
         if is_mode and k != "bracketsettings":
             if "bracket" in vl:
                 active.append(_kind_from_text(vl))
+            elif k in ("shootingmode", "releasemode2", "releasemode3", "drivemode"):
+                mode_said_off = True
             continue
         # A tag whose *name* mentions bracketing.
-        if vl in _OFF_VALUES or vl.startswith("off") or vl.startswith("no "):
+        if vl in _OFF_VALUES or vl.startswith("off") or vl.startswith("no ") or vl.startswith("disable"):
             saw_off = True
             continue
-        if k in ("aebbracketvalue", "exposurebracketvalue", "bracketvalue"):
+        if k in ("aebbracketvalue", "bracketvalue"):  # Canon: the bracket *amount*; 0 means off
             try:
                 if abs(float(v.replace("EV", "").strip())) > 1e-6:
                     active.append("exposure")
@@ -140,10 +163,18 @@ def classify_bracket(record: dict) -> tuple[str | None, int | None]:
         if k == "bracketmode":
             active.append({"aeb": "exposure", "feb": "flash", "iso": "iso", "wb": "wb"}.get(vl, _kind_from_text(vl)))
             continue
-        if any(s in k for s in ("step", "count", "increment", "width", "value", "shotnumber")):
+        if k == "bracketprogram":  # Nikon: "5F", "3F", "2F+" ... or "Disabled"
+            active.append("exposure")
+            continue
+        if any(s in k for s in ("step", "count", "increment", "width", "value", "shotnumber", "frames")):
             continue  # parameters, not on/off switches
         name_kind = _kind_from_text(k)
         active.append(name_kind if name_kind != "exposure" else _kind_from_text(vl))
+    mode_says_bracket = any("bracket" in str(v).lower() for k, v in record.items() if k.lower() in _MODE_KEYS)
+    if mode_said_off and not mode_says_bracket:
+        # e.g. Nikon ShootingMode "Continuous, Auto ISO": bracketing is off for this frame,
+        # whatever the configuration tags (BracketSet, AutoBracketModeM ...) say.
+        return "none", None
     if active:
         for pref in ("exposure", "focus", "flash", "iso", "wb"):
             if pref in active:
@@ -151,6 +182,21 @@ def classify_bracket(record: dict) -> tuple[str | None, int | None]:
                 break
         return kind, position if kind in ("exposure", "focus") else None
     return ("none" if saw_off else None), None
+
+
+def bracket_slot(record: dict) -> float | None:
+    """This frame's offset within the camera's bracket program (Nikon ExposureBracketValue), in EV."""
+    for key, value in record.items():
+        if key.lower() in _SLOT_KEYS:
+            text = str(value).replace("EV", "").strip()
+            try:
+                if "/" in text:
+                    num, den = text.split("/", 1)
+                    return float(num) / float(den)
+                return float(text)
+            except (ValueError, ZeroDivisionError):
+                return None
+    return None
 
 
 def _f(v) -> float | None:
@@ -198,8 +244,32 @@ def meta_from_record(rec: dict) -> FileMeta:
         bracket_position=pos,
         drive_mode=drive,
         sequence_number=seq,
+        bracket_value=bracket_slot(rec) if kind == "exposure" else None,
+        shutter_count=_shutter_count(rec),
+        utc_offset=_offset_seconds(rec.get("OffsetTimeOriginal")),
         reader="exiftool",
     )
+
+
+def _shutter_count(rec: dict) -> int | None:
+    for k in ("ShutterCount", "ImageCount"):
+        try:
+            n = int(float(rec[k]))
+            if n > 0:
+                return n
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None
+
+
+def _offset_seconds(text) -> float | None:
+    if isinstance(text, str) and len(text) >= 6 and text[0] in "+-" and text[3] == ":":
+        try:
+            sign = 1 if text[0] == "+" else -1
+            return sign * (int(text[1:3]) * 3600 + int(text[4:6]) * 60)
+        except ValueError:
+            return None
+    return None
 
 
 def _run_batch(paths: list[Path]) -> list[FileMeta]:

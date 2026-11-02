@@ -143,6 +143,27 @@ def _ev_close(a: Shot, b: Shot, m: BurstModel) -> bool:
     return abs(a.ev - b.ev) <= m.ev_jump_threshold
 
 
+def _subject_change(a: Shot, b: Shot, m: BurstModel) -> bool | None:
+    """Did the camera swing to a different subject between a and b? None when previews are unknown."""
+    from .pixels import DIFFERENT, similarity
+
+    sim = similarity(a, b)
+    if sim is not None:
+        return sim < DIFFERENT
+    h = _hamming(a, b)
+    return None if h is None else h >= m.hash_change_min
+
+
+def _alike(a: Shot, b: Shot, m: BurstModel) -> bool:
+    from .pixels import SAME_SCENE, similarity
+
+    sim = similarity(a, b)
+    if sim is not None:
+        return sim >= SAME_SCENE
+    h = _hamming(a, b)
+    return h is not None and h <= m.hash_same_max
+
+
 def _hamming(a: Shot, b: Shot) -> int | None:
     pa, pb = getattr(a.pixels, "dhash", None), getattr(b.pixels, "dhash", None)
     if pa is None or pb is None:
@@ -210,11 +231,11 @@ def _pairs(chain: list[Shot], cfg: BurstConfig) -> list[_Pair]:
         elif "single" in (ma.drive_mode, mb.drive_mode):
             meta -= m.drive_single
             cand = True
-        h = _hamming(a, b)
-        if h is not None:
-            if h <= m.hash_same_max:
+        change = _subject_change(a, b, m)
+        if change is not None:
+            if not change and _alike(a, b, m):
                 meta += m.hash_same
-            elif h >= m.hash_change_min:
+            elif change:
                 meta -= m.hash_change
                 cand = True
         precise = ma.time_precise and mb.time_precise and iv is not None
@@ -223,7 +244,7 @@ def _pairs(chain: list[Shot], cfg: BurstConfig) -> list[_Pair]:
         run = 0
         if not precise and iv is not None and round(iv) == 0:
             run = (out[-1].same_second_run if out and not out[-1].precise else 0) + 1
-        out.append(_Pair(iv, meta, hard, cand, precise, run, h is not None and h >= m.hash_change_min))
+        out.append(_Pair(iv, meta, hard, cand, precise, run, bool(change)))
     # timing: an interval far off its neighbours' cadence may be a boundary or a pace change
     # (measured on dead time when slow shutters dominate the interval)
     ivs = [p.interval for p in out]
@@ -426,7 +447,7 @@ def _burst_group(chain: list[Shot], pairs: list[_Pair], lo: int, hi: int, cadenc
     seqs = [s.meta.sequence_number for s in shots]
     if all(q is not None for q in seqs):
         evidence.append(f"burst sequence numbers {seqs[0]}..{seqs[-1]}")
-    if any((h := _hamming(x, y)) is not None and h <= m.hash_same_max for x, y in zip(shots, shots[1:])):
+    if any(_alike(x, y, m) for x, y in zip(shots, shots[1:])):
         evidence.append("consecutive previews look alike")
     if lo > 0 and pairs[lo - 1].interval is not None:
         why = "subject changed" if pairs[lo - 1].subject_change else "sequence restarted" if pairs[lo - 1].hard_split else "separate press"

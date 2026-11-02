@@ -17,6 +17,9 @@ clipping is measured conservatively relative to the RAW.
 from __future__ import annotations
 
 import io
+import math
+from functools import lru_cache
+import operator
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -36,7 +39,9 @@ class PixelConfig:
     under_mean: float = 0.07  # or mean level below this -> "under"
     ettr_tolerance: float = 0.005  # best_exposed: highlights clipped must stay below 0.5%
     scene_window: float = 120.0  # s: max pause between groups of one near-duplicate scene
-    hash_threshold: int = 12  # max differing bits (of 64) between near-duplicates
+    scene_lookback: int = 4  # compare with this many recent groups, not just the previous one
+    hash_threshold: int = 12  # dHash fallback only: bits (of 64) that map to scene_similarity
+    scene_similarity: float = 0.6  # preview similarity (-1..1) at or above which groups are one scene
 
 
 @dataclass(slots=True, frozen=True)
@@ -46,10 +51,57 @@ class PixelStats:
     shadows: float  # fraction of pixels with crushed luma
     mean: float  # mean luma, 0..1
     flag: str  # "ok", "over", "under"
+    thumb: bytes | None = None  # THUMB_W x THUMB_H grayscale, for shift-tolerant similarity
 
     def to_dict(self) -> dict:
         return {"highlights_clipped": round(self.highlights, 4), "shadows_crushed": round(self.shadows, 4),
                 "mean": round(self.mean, 3), "flag": self.flag}
+
+
+# --------------------------------------------------------------------------- similarity
+#
+# Two frames of one composition taken handheld drift by a few % of the frame and may differ in
+# exposure. dHash compares fixed pixel positions, so on fine texture (foliage, ivy, fog) such a drift
+# flips many bits. Instead, compare small grayscale thumbnails by normalised cross-correlation at
+# the best of a few small shifts: invariant to brightness/contrast (exposure brackets), tolerant to
+# drift up to SHIFT/INNER_W of the frame, and blurred enough that fine texture doesn't dominate.
+
+THUMB_W, THUMB_H = 28, 20
+SHIFT = 2  # pixels each way: +-2/24 = +-8 % of the frame width
+INNER_W, INNER_H = THUMB_W - 2 * SHIFT, THUMB_H - 2 * SHIFT
+SAME_SCENE = 0.6  # similarity at or above: same composition / subject
+DIFFERENT = 0.35  # similarity below: recomposed or a different subject
+
+
+@lru_cache(maxsize=65536)
+def _window(thumb: bytes, dx: int, dy: int) -> tuple[float, ...]:
+    vals: list[float] = []
+    for y in range(SHIFT + dy, SHIFT + dy + INNER_H):
+        row = y * THUMB_W + SHIFT + dx
+        vals.extend(thumb[row : row + INNER_W])
+    n = len(vals)
+    mean = sum(vals) / n
+    centred = [v - mean for v in vals]
+    norm = math.sqrt(sum(v * v for v in centred)) or 1.0
+    return tuple(v / norm for v in centred)
+
+
+def thumb_similarity(a: bytes, b: bytes) -> float:
+    """Best normalised cross-correlation of two thumbnails over small shifts (-1..1)."""
+    ref = _window(a, 0, 0)
+    best = -1.0
+    for dy in range(-SHIFT, SHIFT + 1):
+        for dx in range(-SHIFT, SHIFT + 1):
+            best = max(best, sum(map(operator.mul, ref, _window(b, dx, dy))))
+    return best
+
+
+def similarity(a, b) -> float | None:
+    """Similarity of two shots' previews, or None when either wasn't analysed."""
+    ta, tb = getattr(a.pixels, "thumb", None), getattr(b.pixels, "thumb", None)
+    if ta is None or tb is None:
+        return None
+    return thumb_similarity(ta, tb)
 
 
 def available() -> bool:
@@ -99,7 +151,8 @@ def analyse_file(path: Path, cfg: PixelConfig = PixelConfig()) -> PixelStats | N
         flag = "under"
     else:
         flag = "ok"
-    return PixelStats(_dhash(gray), highlights, shadows, mean, flag)
+    thumb = gray.resize((THUMB_W, THUMB_H), Image.Resampling.BOX).tobytes()
+    return PixelStats(_dhash(gray), highlights, shadows, mean, flag, thumb)
 
 
 def _hamming(a: int, b: int) -> int:
@@ -141,23 +194,44 @@ def pick_best_exposed(g: Group, cfg: PixelConfig = PixelConfig()) -> int | None:
     return usable[-1] if usable else order[0]
 
 
+def _looks_alike(a: Group, b: Group, cfg: PixelConfig) -> float | None:
+    """Similarity of two groups' representatives in 0..1-ish (None when unknown)."""
+    sa, sb = a.shots[a.representative], b.shots[b.representative]
+    sim = similarity(sa, sb)
+    if sim is not None:
+        return sim
+    pa, pb = sa.pixels, sb.pixels
+    if pa is None or pb is None:
+        return None
+    # dHash fallback (e.g. stats computed elsewhere without a thumbnail): map bit distance to a score
+    return 1.0 - _hamming(pa.dhash, pb.dhash) / (cfg.hash_threshold * 2.5)  # type: ignore[attr-defined]
+
+
 def assign_scenes(groups: list[Group], cfg: PixelConfig = PixelConfig()) -> None:
-    """Link consecutive look-alike groups (per camera body) into near-duplicate scenes."""
-    last_by_cam: dict[tuple, Group] = {}
+    """Link look-alike groups shot close together (per camera body) into near-duplicate scenes.
+
+    Each group is compared with the last `scene_lookback` groups from the same body within
+    `scene_window` seconds, not just the previous one, so one odd frame (a recompose, someone
+    walking through) doesn't cut a scene in two. The best match above SAME_SCENE wins.
+    """
+    recent: dict[tuple, list[Group]] = {}
     next_id = 1
+    threshold = cfg.scene_similarity
     for g in sorted(groups, key=lambda g: (g.shots[0].time is None, g.shots[0].time or 0.0, g.shots[0].name)):
         cam = g.shots[0].camera_key
-        rep = g.shots[g.representative].pixels
-        prev = last_by_cam.get(cam)
-        joined = False
-        if prev is not None and rep is not None:
-            prev_rep = prev.shots[prev.representative].pixels
-            t_prev, t_now = prev.shots[-1].time, g.shots[0].time
-            close = t_prev is not None and t_now is not None and t_now - t_prev <= cfg.scene_window
-            if close and prev_rep is not None and _hamming(prev_rep.dhash, rep.dhash) <= cfg.hash_threshold:  # type: ignore[union-attr,attr-defined]
-                g.scene = prev.scene
-                joined = True
-        if not joined:
+        window = recent.setdefault(cam, [])
+        t_now = g.shots[0].time
+        best, best_sim = None, threshold
+        for prev in reversed(window[-cfg.scene_lookback :]):
+            t_prev = prev.shots[-1].time
+            if t_prev is None or t_now is None or t_now - t_prev > cfg.scene_window:
+                continue
+            sim = _looks_alike(prev, g, cfg)
+            if sim is not None and sim >= best_sim:
+                best, best_sim = prev, sim
+        if best is not None:
+            g.scene = best.scene
+        else:
             g.scene = next_id
             next_id += 1
-        last_by_cam[cam] = g
+        window.append(g)

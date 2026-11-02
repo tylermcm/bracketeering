@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .model import Group
@@ -21,10 +21,8 @@ class Action:
 
 def folder_name(g: Group, index: int) -> str:
     first = g.shots[0]
-    stamp = (
-        datetime.fromtimestamp(first.time, tz=timezone.utc).strftime("%Y%m%d-%H%M%S")
-        if first.time is not None else "undated"
-    )
+    tz = timezone(timedelta(seconds=first.meta.utc_offset)) if first.meta.utc_offset is not None else timezone.utc
+    stamp = datetime.fromtimestamp(first.time, tz=tz).strftime("%Y%m%d-%H%M%S") if first.time is not None else "undated"
     stem = first.meta.path.stem
     if g.kind == "exposure":
         return f"{stamp}_{stem}_HDR{g.size}x{g.step_ev:g}EV"

@@ -23,6 +23,8 @@ _DEFAULTS = EngineConfig()
 def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("paths", nargs="+", type=Path, help="files or folders to scan")
     p.add_argument("--no-recursive", action="store_true", help="do not descend into subfolders")
+    p.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
+                   help="skip subfolders whose name matches (glob, repeatable), e.g. --exclude _winners")
     p.add_argument("--backend", choices=BACKENDS, default="auto",
                    help="metadata reader: auto (native + exiftool fallback), native, or exiftool (adds maker-note bracket tags)")
     p.add_argument("--workers", type=int, help="parallel metadata readers")
@@ -43,8 +45,9 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                    help="analyse embedded previews (needs Pillow): exposure stats, best-exposed frame, near-duplicate scenes")
     p.add_argument("--scene-window", type=float, default=PixelConfig().scene_window,
                    help="max seconds between groups of one near-duplicate scene (default %(default)s)")
-    p.add_argument("--hash-threshold", type=int, default=PixelConfig().hash_threshold,
-                   help="near-duplicate similarity: max differing hash bits of 64 (default %(default)s)")
+    p.add_argument("--scene-similarity", type=float, default=PixelConfig().scene_similarity,
+                   help="near-duplicate threshold: preview similarity -1..1 at or above which groups are one scene "
+                        "(default %(default)s; lower links more)")
 
 
 def _config(a: argparse.Namespace) -> EngineConfig:
@@ -62,9 +65,9 @@ def _run(a: argparse.Namespace):
             hint = '\n  (folder names with spaces need quotes: bracketeer scan "My Photos/Day 1")'
         raise ValueError("no such file or folder: " + ", ".join(str(p) for p in missing) + hint)
     t0 = time.perf_counter()
-    pcfg = PixelConfig(scene_window=a.scene_window, hash_threshold=a.hash_threshold)
+    pcfg = PixelConfig(scene_window=a.scene_window, scene_similarity=a.scene_similarity)
     groups, errors = analyze(a.paths, _config(a), backend=a.backend, recursive=not a.no_recursive,
-                             workers=a.workers, pixels=a.pixels, pixel_config=pcfg)
+                             workers=a.workers, pixels=a.pixels, pixel_config=pcfg, exclude=a.exclude)
     n = sum(g.size for g in groups)
     if n == 0:
         raise ValueError("no photos found in " + ", ".join(str(p) for p in a.paths)

@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import struct
 
-ASCII, SHORT, LONG, RATIONAL, SRATIONAL = 2, 3, 4, 5, 10
+ASCII, SHORT, LONG, RATIONAL, UNDEFINED, SRATIONAL = 2, 3, 4, 5, 7, 10
 
 
 def _encode(e: str, typ: int, value) -> tuple[bytes, int]:
     if typ == ASCII:
         data = value.encode() + b"\x00"
         return data, len(data)
+    if typ == UNDEFINED:
+        return bytes(value), len(value)
     vals = value if isinstance(value, list) else [value]
     if typ == SHORT:
         return struct.pack(f"{e}{len(vals)}H", *vals), len(vals)
@@ -114,3 +116,11 @@ def standard_tags(exposure=(1, 250), fnum=(8, 1), iso=100, bias=(0, 1), mode=2, 
         (0xA434, ASCII, "RF24-70mm F2.8 L IS USM"),
     ]
     return ifd0, exif
+
+
+def nikon_makernote(shooting_mode: int, bracket_value: tuple[int, int] | None, shutter_count: int) -> bytes:
+    """Nikon type-3 maker note: "Nikon\\0", version 2.11, then a TIFF structure with its own offsets."""
+    entries = [(0x0089, SHORT, shooting_mode), (0x00A7, LONG, shutter_count)]
+    if bracket_value is not None:
+        entries.append((0x0019, SRATIONAL, bracket_value))
+    return b"Nikon\x00\x02\x11\x00\x00" + build_tiff_flat(entries, big_endian=True)

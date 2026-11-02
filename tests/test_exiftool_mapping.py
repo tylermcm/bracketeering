@@ -10,7 +10,13 @@ from bracketeering.metadata.exiftool import classify_bracket, meta_from_record
     ({"BracketMode": "FEB"}, ("flash", None)),
     ({"BracketMode": "Off"}, ("none", None)),
     ({"ReleaseMode2": "Continuous - Exposure Bracketing", "SequenceNumber": 2}, ("exposure", 2)),
-    ({"ReleaseMode2": "Normal"}, (None, None)),
+    ({"ReleaseMode2": "Normal"}, ("none", None)),
+    # Nikon writes bracketing *configuration* on every frame; ShootingMode says whether it was on
+    ({"ExposureBracketValue": 0, "BracketSet": "AE", "BracketProgram": "Disabled",
+      "AutoBracketModeM": "Flash/Speed", "ShootingMode": "Continuous"}, ("none", None)),
+    ({"ExposureBracketValue": -1.333, "BracketSet": "AE", "BracketProgram": "5F",
+      "AutoBracketModeM": "Flash/Speed", "ShootingMode": "Continuous, Exposure Bracketing, Auto ISO"}, ("exposure", None)),
+    ({"BracketProgram": "Disabled"}, ("none", None)),
     ({"ShootingMode": "Continuous, Exposure Bracketing"}, ("exposure", None)),
     ({"ShootingMode": "Single-Frame, White Balance Bracketing"}, ("wb", None)),
     ({"AutoBracketing": "On", "SequenceNumber": 1}, ("exposure", 1)),
@@ -58,3 +64,18 @@ def test_meta_from_record():
 def test_classify_drive(record, expected):
     from bracketeering.metadata.exiftool import classify_drive
     assert classify_drive(record) == expected
+
+
+def test_nikon_slot_and_shutter_count():
+    from bracketeering.metadata.exiftool import bracket_slot
+    m = meta_from_record({
+        "SourceFile": "/a/_DSC1704.NEF", "Make": "NIKON CORPORATION", "Model": "NIKON Z 7_2",
+        "DateTimeOriginal": "2026:08:26 04:47:23", "SubSecTimeOriginal": "10", "OffsetTimeOriginal": "-07:00",
+        "ExposureTime": 1 / 60, "FNumber": 1.8, "ISO": 360, "ExposureBracketValue": -1.3333333,
+        "ShootingMode": "Continuous, Exposure Bracketing, Auto ISO", "BracketSet": "AE", "ShutterCount": 20483,
+    })
+    assert m.bracket_kind == "exposure"
+    assert m.bracket_value == pytest.approx(-4 / 3, abs=1e-3)
+    assert m.shutter_count == 20483
+    assert m.utc_offset == -7 * 3600
+    assert bracket_slot({"ExposureBracketValue": "+2/3"}) == pytest.approx(2 / 3)

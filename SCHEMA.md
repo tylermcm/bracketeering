@@ -22,11 +22,11 @@
 | `size` | int | number of shots (a RAW+JPEG pair is one shot) |
 | `confidence` | float 0–1 | detection confidence (1.0 for singles). For bursts it is the log-odds of "one press of the shutter" vs "separate presses", squashed to 0–1. On simulated shoots, bursts at ≥ 0.9 were exactly right 95% of the time and those at 0.5–0.7 about 77% |
 | `camera` | string \| null | make + model |
-| `start` | ISO time \| null | capture time of the first frame (UTC if the file records an offset, else camera-local) |
+| `start` | ISO time \| null | capture time of the first frame, camera-local, with its UTC offset when the file records one (e.g. `2026-08-26T04:47:21.990-07:00`) |
 | `representative` | path | the frame that stands for the group. Exposure brackets: the middle exposure (≈ 0 EV). Bursts, timelapses and focus stacks: the middle frame. |
 | `best_exposed` | path \| null | exposure brackets with `--pixels`: brightest frame whose highlights hold (expose to the right) |
 | `scene` | int \| null | with `--pixels`: near-duplicate scene id. Groups sharing an id are the same subject shot repeatedly |
-| `ev_offsets` | float[] \| null | exposure brackets: each frame's offset in stops from the middle exposure, in capture order |
+| `ev_offsets` | float[] \| null | exposure brackets: each frame's offset in stops, in capture order. When the camera recorded its bracket program (maker notes), these are the camera's own slots relative to the metered frame (e.g. `[0, -1.33, -0.67]`). Otherwise they're measured, relative to the middle exposure |
 | `step_ev` | float \| null | exposure brackets: bracket step in stops |
 | `evidence` | string[] | why the group was formed (human-readable) |
 | `warnings` | string[] | e.g. missing frames, incomplete bracket, weak candidate demoted |
@@ -42,7 +42,7 @@
 | `kind` | string | that group's kind |
 | `role` | `"representative"` \| `"member"` \| `"single"` | the file's role in its group |
 | `position` | int | 1-based capture position within the group |
-| `primary` | bool | false for a sidecar (e.g. the JPEG half of a RAW+JPEG pair); sidecars share their shot's role |
+| `primary` | bool | false for a sidecar (e.g. the JPEG half of a RAW+JPEG pair) and for copies of the same capture in other folders (e.g. a `_picks/` folder); they share their shot's role |
 | `scene` | int \| null | near-duplicate scene id (with `--pixels`) |
 | `best_exposed` | bool \| null | exposure brackets with `--pixels` |
 | `error` | string \| null | metadata read error, if any |

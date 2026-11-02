@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import os
 from collections import defaultdict
 from collections.abc import Iterable
@@ -12,8 +13,12 @@ from .model import IMAGE_EXTENSIONS, FileMeta, Shot
 SIDECAR_TIME_TOLERANCE = 1.5  # seconds
 
 
-def discover(roots: Iterable[Path], recursive: bool = True) -> list[Path]:
-    """Find image files under the given roots (files are accepted as-is)."""
+def discover(roots: Iterable[Path], recursive: bool = True, exclude: Iterable[str] = ()) -> list[Path]:
+    """Find image files under the given roots (files are accepted as-is).
+
+    `exclude` holds glob patterns matched against folder names (e.g. "_winners", "*export*").
+    """
+    patterns = list(exclude)
     found: list[Path] = []
     stack = []
     for root in roots:
@@ -30,7 +35,7 @@ def discover(roots: Iterable[Path], recursive: bool = True) -> list[Path]:
                     if entry.name.startswith("."):
                         continue
                     if entry.is_dir(follow_symlinks=False):
-                        if recursive:
+                        if recursive and not any(fnmatch.fnmatch(entry.name, p) for p in patterns):
                             stack.append(Path(entry.path))
                     elif os.path.splitext(entry.name)[1].lower() in IMAGE_EXTENSIONS:
                         found.append(Path(entry.path))
@@ -61,4 +66,41 @@ def pair_sidecars(metas: list[FileMeta]) -> list[Shot]:
             else:
                 clusters.append([f])
         shots.extend(Shot(c) for c in clusters)
-    return shots
+    return merge_copies(shots)
+
+
+def _identity(s: Shot) -> tuple | None:
+    """A key that only two files of the *same capture* share."""
+    m = s.meta
+    cam = s.camera_key
+    if not any(cam):
+        return None
+    if m.shutter_count is not None:
+        return (cam, "count", m.shutter_count)
+    if m.capture_time is not None and m.time_precise and m.file_number is not None:
+        return (cam, "time", round(m.capture_time, 3), m.file_number, m.exposure_time, m.f_number, m.iso)
+    return None
+
+
+def merge_copies(shots: list[Shot]) -> list[Shot]:
+    """Merge copies of one capture found in different folders (e.g. a "_picks" folder) into one shot.
+
+    Without this, a copy and its original look like two frames 0 s apart: a fake burst. The file
+    in the shallowest folder becomes the primary; the copies stay listed under the same shot.
+    """
+    by_key: dict[tuple, list[Shot]] = defaultdict(list)
+    out: list[Shot] = []
+    for s in shots:
+        key = _identity(s)
+        if key is None:
+            out.append(s)
+        else:
+            by_key[key].append(s)
+    for same in by_key.values():
+        if len(same) == 1:
+            out.append(same[0])
+            continue
+        same.sort(key=lambda s: (len(s.meta.path.parts), str(s.meta.path)))
+        files = [f for s in same for f in s.files]
+        out.append(Shot(files))  # primary: the RAW in the shallowest folder (see Shot.__post_init__)
+    return out

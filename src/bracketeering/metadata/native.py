@@ -31,6 +31,10 @@ T_DTO, T_OFFSET_DTO, T_SUBSEC_DTO = 0x9003, 0x9011, 0x9291
 T_BIAS, T_SUBJ_DIST, T_FLASH, T_FOCAL = 0x9204, 0x9206, 0x9209, 0x920A
 T_EXPMODE, T_WB = 0xA402, 0xA403
 T_BODY_SERIAL, T_LENS_MODEL = 0xA431, 0xA434
+T_MAKERNOTE = 0x927C
+# Nikon type-3 maker note tags (same ids as exiftool's Nikon::Main table)
+N_EXPOSURE_BRACKET_VALUE, N_SHOOTING_MODE, N_SHUTTER_COUNT, N_SERIAL = 0x0019, 0x0089, 0x00A7, 0x001D
+N_MODE_CONTINUOUS, N_MODE_EXPOSURE_BRACKETING = 1 << 0, 1 << 4
 
 _TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8, 13: 4}
 _MAX_IFD_ENTRIES = 1024
@@ -82,7 +86,7 @@ class _Tiff:
                 continue
             nbytes = size * cnt
             field = raw[i * 12 + 8 : i * 12 + 12]
-            if tag == T_RW2_JPEG and typ == 7:  # keep embedded JPEG as (offset, length)
+            if tag in (T_RW2_JPEG, T_MAKERNOTE) and typ == 7:  # keep embedded blobs as (offset, length)
                 (voff,) = struct.unpack(self.e + "I", field)
                 out[tag] = (voff, nbytes)
                 continue
@@ -204,7 +208,28 @@ def _tiff_tags(f: BinaryIO, base: int = 0, depth: int = 0) -> tuple[dict, dict]:
             sub0, subexif = _tiff_tags(io.BytesIO(payload), 0, depth + 1)
             ifd0 = {**sub0, **ifd0}
             exif = subexif
+    make = ifd0.get(T_MAKE)
+    note = exif.get(T_MAKERNOTE)
+    if isinstance(make, str) and make.upper().startswith("NIKON") and isinstance(note, tuple):
+        try:
+            exif["nikon"] = _nikon_makernote(f, base + note[0])
+        except (ValueError, struct.error):
+            pass
     return ifd0, exif
+
+
+def _nikon_makernote(f: BinaryIO, start: int) -> dict:
+    """Read a few tags from a Nikon type-3 maker note ("Nikon\0" + version + embedded TIFF header).
+
+    Only unencrypted tags are used: ShootingMode (bitmask), ExposureBracketValue (this
+    frame's slot in the bracket program) and ShutterCount.
+    """
+    f.seek(start)
+    if f.read(6) != b"Nikon\x00":
+        raise ValueError("not a Nikon type-3 maker note")
+    t = _Tiff(f, start + 10)  # offsets inside the note are relative to its own TIFF header
+    tags = t.ifd(t.ifd0)
+    return {k: tags[k] for k in (N_EXPOSURE_BRACKET_VALUE, N_SHOOTING_MODE, N_SHUTTER_COUNT, N_SERIAL) if k in tags}
 
 
 def read_tags(path: Path) -> tuple[dict, dict]:
@@ -257,6 +282,15 @@ def _parse_time(dto: object, subsec: object, offset: object) -> tuple[float | No
     return ts, precise
 
 
+def _offset(v: object) -> float | None:
+    if isinstance(v, str) and len(v) >= 6 and v[0] in "+-" and v[3] == ":":
+        try:
+            return (1 if v[0] == "+" else -1) * (int(v[1:3]) * 3600 + int(v[4:6]) * 60)
+        except ValueError:
+            return None
+    return None
+
+
 def _num(v: object) -> float | None:
     if isinstance(v, (list, tuple)):
         v = v[0] if v else None
@@ -276,11 +310,25 @@ def meta_from_tags(path: Path, ifd0: dict, exif: dict) -> FileMeta:
         iso = _num(exif.get(T_ISOSPEED)) or _num(exif.get(T_REI)) or iso
     flash = _num(exif.get(T_FLASH))
     dist = _num(exif.get(T_SUBJ_DIST))
+    nikon = exif.get("nikon") or {}
+    bracket_kind = drive = None
+    slot = shutter_count = None
+    mode = nikon.get(N_SHOOTING_MODE)
+    if isinstance(mode, int):
+        bracket_kind = "exposure" if mode & N_MODE_EXPOSURE_BRACKETING else "none"
+        drive = "continuous" if mode & N_MODE_CONTINUOUS else "single"
+        if bracket_kind == "exposure":
+            v = _num(nikon.get(N_EXPOSURE_BRACKET_VALUE))
+            slot = v if v is not None and abs(v) <= 10 else None
+    sc = nikon.get(N_SHUTTER_COUNT)
+    if isinstance(sc, int) and sc > 0:
+        shutter_count = sc
+    serial = _str(exif.get(T_BODY_SERIAL)) or _str(nikon.get(N_SERIAL))
     return FileMeta(
         path=path,
         make=_str(ifd0.get(T_MAKE)),
         model=_str(ifd0.get(T_MODEL)),
-        serial=_str(exif.get(T_BODY_SERIAL)),
+        serial=serial,
         lens=_str(exif.get(T_LENS_MODEL)),
         capture_time=t,
         time_precise=precise,
@@ -294,6 +342,11 @@ def meta_from_tags(path: Path, ifd0: dict, exif: dict) -> FileMeta:
         white_balance=int(w) if (w := _num(exif.get(T_WB))) is not None else None,
         flash_fired=bool(int(flash) & 1) if flash is not None else None,
         focus_distance=dist if dist is not None and 0 < dist < 1e6 else None,
+        bracket_kind=bracket_kind,
+        bracket_value=slot,
+        drive_mode=drive,
+        shutter_count=shutter_count,
+        utc_offset=_offset(exif.get(T_OFFSET_DTO)),
         reader="native",
     )
 

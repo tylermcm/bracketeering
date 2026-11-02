@@ -113,3 +113,22 @@ def test_matches_pillow(tmp_path):
     assert m.exposure_mode == 2
     assert m.time_precise
     assert m.file_number == 1234
+
+
+@pytest.mark.parametrize("mode,slot,kind,drive", [
+    (0b110001, (-4, 3), "exposure", "continuous"),  # Continuous, Exposure Bracketing, Auto ISO
+    (0b100001, None, "none", "continuous"),  # Continuous, Auto ISO (bracketing off)
+    (0b000000, None, "none", "single"),  # Single-Frame
+])
+def test_nikon_makernote(tmp_path, mode, slot, kind, drive):
+    from exifbuilder import UNDEFINED, nikon_makernote
+    ifd0, exif = standard_tags()
+    ifd0 = [(t, ty, ("NIKON CORPORATION" if t == 0x010F else "NIKON Z 7_2" if t == 0x0110 else v)) for t, ty, v in ifd0]
+    exif = exif + [(0x927C, UNDEFINED, nikon_makernote(mode, slot, 20483))]
+    p = tmp_path / "_DSC1704.NEF"
+    p.write_bytes(build_tiff(ifd0, exif) + b"\x00" * 512)
+    m = read_native(p)
+    assert m.error is None, m.error
+    assert (m.bracket_kind, m.drive_mode, m.shutter_count) == (kind, drive, 20483)
+    assert m.bracket_value == (pytest.approx(slot[0] / slot[1]) if slot else None)
+    assert m.utc_offset == 2 * 3600

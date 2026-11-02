@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from pathlib import Path  # noqa: E402
 
@@ -19,6 +19,7 @@ def analyze(
     workers: int | None = None,
     pixels: bool = False,
     pixel_config: "PixelConfig | None" = None,
+    exclude: list[str] | tuple[str, ...] = (),
 ) -> tuple[list[Group], list[FileMeta]]:
     """Scan files/directories and return (groups, unreadable_files).
 
@@ -28,7 +29,7 @@ def analyze(
     from .metadata import read_many
     from .scan import discover, pair_sidecars
 
-    files = discover([Path(p) for p in paths], recursive=recursive)
+    files = discover([Path(p) for p in paths], recursive=recursive, exclude=exclude)
     metas = read_many(files, backend=backend, workers=workers)
     errors = [m for m in metas if m.error]
     shots = pair_sidecars(metas)

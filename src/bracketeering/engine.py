@@ -30,7 +30,9 @@ from functools import lru_cache
 from statistics import median
 
 from .bursts import BurstConfig, TimelapseConfig, form_bursts, form_timelapses
+from .cycles import CycleConfig, bracket_cycles
 from .model import Group, Shot, frame_step
+from .pixels import similarity
 
 NEG_INF = float("-inf")
 
@@ -60,6 +62,7 @@ class EngineConfig:
     detect_bursts: bool = True
     bursts: BurstConfig = field(default_factory=BurstConfig)
     detect_timelapse: bool = True
+    cycles: CycleConfig = field(default_factory=CycleConfig)
     timelapse: TimelapseConfig = field(default_factory=TimelapseConfig)
     min_confidence: float = 0.5  # exposure brackets below this are reported as singles
 
@@ -329,7 +332,7 @@ def _score_exposure(shots: list[Shot], ctx: _CameraContext, cfg: EngineConfig) -
     elif all(_is_manual(s) for s in shots):
         if n >= 3:
             score -= W.manual_bracket * n
-            ev.append("manual exposure (user-driven bracket)")
+            ev.append("Manual exposure mode, no auto-bracket flag: likely adjusted by hand")
         else:
             return _Eval(NEG_INF, "manual2")
     elif ctx.reports_aeb:
@@ -339,6 +342,9 @@ def _score_exposure(shots: list[Shot], ctx: _CameraContext, cfg: EngineConfig) -
             warn.append(f"only {n_aeb}/{n} frames flagged auto bracket")
 
     kinds = [m.bracket_kind for m in metas]
+    if any(k == "none" for k in kinds):
+        # The camera recorded that auto-bracketing was off for (some of) these frames.
+        return _Eval(NEG_INF, "maker-off")
     if all(k == "exposure" for k in kinds):
         score += W.maker * n
         meta_support = True
@@ -605,6 +611,8 @@ def _dominant_signature(groups: list[Group]) -> Signature | None:
 
 def _pick_representative(g: Group) -> int:
     """Index of the frame that stands for the group (what a culler should look at)."""
+    if g.kind == "exposure" and (slots := g.slots) is not None:
+        return min(range(g.size), key=lambda i: (abs(slots[i]), i))  # the metered frame
     if g.kind == "exposure":
         evs = [s.ev for s in g.shots]
         if all(e is not None for e in evs):
@@ -645,12 +653,14 @@ def detect(shots: list[Shot], cfg: EngineConfig | None = None) -> list[Group]:
     for cam_shots in by_cam.values():
         cam_shots.sort(key=_order_key)
         ctx = _CameraContext(reports_aeb=any(s.meta.exposure_mode == 2 for s in cam_shots))
+        maker_groups, cam_shots = bracket_cycles(cam_shots, cfg.cycles, similarity)
         runs = split_runs(cam_shots, cfg)
         cache: _Cache = {}  # group evaluations keyed by (first shot, size); shots outlive the call
         groups = [g for run in runs for g in _segment_run(run, ctx, cfg, None, cache)]
         prior = _dominant_signature(groups) if cfg.use_prior else None
         if prior is not None:
             groups = [g for run in runs for g in _segment_run(run, ctx, cfg, prior, cache)]
+        groups = sorted(maker_groups + groups, key=lambda g: _order_key(g.shots[0]))
         groups = _demote_low_confidence(groups, cfg)
         _annotate(groups, prior)
         if cfg.detect_timelapse:  # before bursts: regular at >= 1 s is a timer, not a drive
