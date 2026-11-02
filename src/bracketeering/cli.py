@@ -55,11 +55,20 @@ def _config(a: argparse.Namespace) -> EngineConfig:
 
 
 def _run(a: argparse.Namespace):
+    missing = [p for p in a.paths if not p.exists()]
+    if missing:
+        hint = ""
+        if any(" " in str(p) or str(p).startswith("PATH") for p in a.paths) or len(a.paths) > 1:
+            hint = '\n  (folder names with spaces need quotes: bracketeer scan "My Photos/Day 1")'
+        raise ValueError("no such file or folder: " + ", ".join(str(p) for p in missing) + hint)
     t0 = time.perf_counter()
     pcfg = PixelConfig(scene_window=a.scene_window, hash_threshold=a.hash_threshold)
     groups, errors = analyze(a.paths, _config(a), backend=a.backend, recursive=not a.no_recursive,
                              workers=a.workers, pixels=a.pixels, pixel_config=pcfg)
     n = sum(g.size for g in groups)
+    if n == 0:
+        raise ValueError("no photos found in " + ", ".join(str(p) for p in a.paths)
+                         + ("" if not a.no_recursive else " (subfolders were skipped: --no-recursive)"))
     print(f"analysed {n} shots in {time.perf_counter() - t0:.2f}s", file=sys.stderr)
     return groups, errors
 

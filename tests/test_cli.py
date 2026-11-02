@@ -51,3 +51,21 @@ def test_organize_copy_and_dry_run(tmp_path, capsys):
     assert len(folders) == 1 and "HDR3x1EV" in folders[0].name
     assert sorted(p.name for p in folders[0].iterdir()) == ["IMG_0001.JPG", "IMG_0002.JPG", "IMG_0003.JPG"]
     assert len(list(src.iterdir())) == 4  # copy leaves sources alone
+
+
+def test_missing_path_is_an_error(tmp_path, capsys):
+    assert main(["scan", str(tmp_path / "Day 1"), "--backend", "native"]) == 2
+    assert "no such file or folder" in capsys.readouterr().err
+
+
+def test_empty_folder_is_an_error(tmp_path, capsys):
+    assert main(["scan", str(tmp_path), "--backend", "native"]) == 2
+    assert "no photos found" in capsys.readouterr().err
+
+
+def test_folder_with_space_in_name(tmp_path, capsys):
+    src = tmp_path / "China 8-26"
+    src.mkdir()
+    _shoot(src)
+    assert main(["scan", str(src), "--backend", "native"]) == 0
+    assert "1 exposure brackets" in capsys.readouterr().out
