@@ -33,11 +33,16 @@ pip install -e '.[pixels]'  # + Pillow, for --pixels
 pip install -e '.[dev]'     # + pytest, pillow for the test-suite
 ```
 
-If pip says the build backend is **missing the `build_editable` hook**, the build is using setuptools older than 64. That happens with `--no-build-isolation`, with conda, or when pip is configured that way. Upgrade the build tools in the same environment and retry:
+If pip says the build backend is **missing the `build_editable` hook**, the build ended up using setuptools older than 64. Common causes:
+- The system pip on Ubuntu 22.04 / Debian (pip 22.0.x, often with "Defaulting to user installation"). A bug there hides the freshly downloaded setuptools from the build.
+- `--no-build-isolation`, or conda.
+
+The reliable fix is a virtual environment with an up-to-date pip:
 
 ```bash
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -e .
+python3 -m venv .venv && source .venv/bin/activate   # Debian/Ubuntu: sudo apt install python3-venv
+python -m pip install --upgrade pip
+python -m pip install -e '.[pixels]'
 ```
 
 You can also skip installing entirely, since there are no required dependencies: `PYTHONPATH=src python -m bracketeering scan PATH`.
