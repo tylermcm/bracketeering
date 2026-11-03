@@ -23,6 +23,7 @@ F00009  focus    24 frames  conf 0.95
 - **No required dependencies.** Pure Python 3.10+. A built-in EXIF reader handles JPEG, TIFF, DNG, CR2, CR3, NEF, NRW, ARW, SR2, ORF, RW2, PEF, RAF and other TIFF-based RAWs. If [exiftool](https://exiftool.org) is installed, it covers everything else and adds maker-note bracket tags.
 - **Efficient.** The reader seeks straight to the IFD entries it needs and reads a few KB per file, even from a 60 MB RAW. Files are read in parallel. In one test, 3,000 RAW-sized files took about 1 s end to end. Grouping runs at 10–20k shots/s.
 - **Pixel analysis is optional.** `--pixels` (needs Pillow) decodes each RAW's embedded JPEG preview, not the RAW itself, at about 5 ms per file.
+- **Pipeline handoff:** see [docs/HANDOFF.md](docs/HANDOFF.md) for what it does, how to call it and where it belongs in a culling pipeline.
 - **Explainable.** Every group lists its evidence, a confidence score, and warnings such as missing frames or partial brackets.
 
 ## Install
